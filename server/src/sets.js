@@ -13,6 +13,8 @@ export class SetError extends Error {}
 
 /**
  * Picture sets on disk: <data>/sets/<id>/set.json plus one JPEG per picture (and optionally map.jpg).
+ * A picture can have a second version for the reveal (`revealFile`), e.g. the uncropped original
+ * when players guess on a cropped or blurred one.
  * Pictures are already processed (rotated, resized, metadata stripped) when they get here.
  */
 export class SetStore {
@@ -111,9 +113,67 @@ export class SetStore {
     return this.update(setId, (set) => {
       const doomed = set.images.filter((i) => imageIds.includes(i.id));
       set.images = set.images.filter((i) => !doomed.includes(i));
-      for (const image of doomed) fs.rmSync(path.join(dir, image.file), { force: true });
+      for (const image of doomed) {
+        for (const file of [image.file, image.revealFile]) if (file) fs.rmSync(path.join(dir, file), { force: true });
+      }
       return doomed.length;
     }) ?? 0;
+  }
+
+  /**
+   * Adds a second version of a picture.
+   * - as 'guess': the new picture is what players guess on; the current one is shown at the reveal
+   *   (unless there already is a reveal picture, then the current one is replaced).
+   * - as 'reveal': the new picture is shown at the reveal.
+   * Returns the changed picture, or null when it doesn't exist.
+   * @param {string} setId
+   * @param {string} imageId
+   * @param {Buffer} buffer
+   * @param {'guess' | 'reveal'} as
+   */
+  addVersion(setId, imageId, buffer, as) {
+    const dir = this.dir(setId);
+    if (!dir || !this.get(setId)?.images.some((i) => i.id === imageId)) return null;
+    const file = `${imageId}-${newId()}.jpg`;
+    fs.writeFileSync(path.join(dir, file), buffer);
+    return this.update(setId, (set) => {
+      const image = set.images.find((i) => i.id === imageId);
+      let old = null;
+      if (as === 'reveal') {
+        old = image.revealFile;
+        image.revealFile = file;
+      } else if (image.revealFile) {
+        old = image.file;
+        image.file = file;
+      } else {
+        image.revealFile = image.file;
+        image.file = file;
+      }
+      if (old) fs.rmSync(path.join(dir, old), { force: true });
+      return image;
+    });
+  }
+
+  /** Swaps the guess and the reveal picture. */
+  swapVersions(setId, imageId) {
+    return this.update(setId, (set) => {
+      const image = set.images.find((i) => i.id === imageId);
+      if (!image?.revealFile) return null;
+      [image.file, image.revealFile] = [image.revealFile, image.file];
+      return image;
+    });
+  }
+
+  /** Drops the reveal picture; the guess picture is then shown at the reveal too. */
+  removeReveal(setId, imageId) {
+    const dir = this.dir(setId);
+    return this.update(setId, (set) => {
+      const image = set.images.find((i) => i.id === imageId);
+      if (!image) return null;
+      if (image.revealFile) fs.rmSync(path.join(dir, image.revealFile), { force: true });
+      delete image.revealFile;
+      return image;
+    });
   }
 
   /**
@@ -152,7 +212,8 @@ export class SetStore {
     if (!set) return null;
     const dir = this.dir(setId);
     const files = { 'set.json': strToU8(JSON.stringify(set, null, 2)) };
-    for (const file of [...set.images.map((i) => i.file), ...(set.map ? [set.map.file] : [])]) {
+    const pictures = set.images.flatMap((i) => [i.file, i.revealFile].filter(Boolean));
+    for (const file of [...pictures, ...(set.map ? [set.map.file] : [])]) {
       // JPEGs are already compressed; storing them is faster and barely bigger.
       files[file] = [fs.readFileSync(path.join(dir, file)), { level: 0 }];
     }
@@ -187,13 +248,15 @@ export class SetStore {
         const data = entries[image.file];
         if (!data) continue;
         const { buffer: jpeg } = await processImage(Buffer.from(data));
-        this.addImage(set.id, {
+        const added = this.addImage(set.id, {
           buffer: jpeg,
           lat: Number.isFinite(image.lat) ? image.lat : null,
           lng: Number.isFinite(image.lng) ? image.lng : null,
           takenAt: parseTakenAt(image.takenAt) === null ? null : image.takenAt,
           caption: String(image.caption ?? '').slice(0, 200),
         });
+        const reveal = typeof image.revealFile === 'string' && entries[image.revealFile];
+        if (reveal) this.addVersion(set.id, added.id, (await processImage(Buffer.from(reveal))).buffer, 'reveal');
       }
     } catch (err) {
       this.delete(set.id);

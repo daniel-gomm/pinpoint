@@ -448,3 +448,13 @@ body.presenting .results { font-size: 1.1rem; }
   .immich-form { grid-template-columns: 1fr; }
 }
 .original-links { margin: 0.25rem 0 0.75rem; font-size: 0.9rem; }
+.badge-reveal { background: var(--water); }
+.detail-versions { display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; width: 300px; flex-shrink: 0; }
+.detail-versions figure { margin: 0; }
+.detail-versions .detail-img { width: 100%; max-height: 120px; }
+.detail-versions figcaption { font-size: 0.8rem; color: var(--ink-soft); }
+.versions { margin: 0 0 0.75rem; padding-top: 0.6rem; border-top: 1px dashed var(--line); }
+.versions .row-actions { margin-top: 0; }
+@media (max-width: 640px) {
+  .detail-versions { width: 100%; }
+}

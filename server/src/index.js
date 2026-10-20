@@ -221,6 +221,35 @@ app.delete('/api/sets/:id/images/:imageId', (req, res) => {
   res.status(204).end();
 });
 
+// A second version of a picture: { as: 'guess' } to guess on a cropped/blurred version and show the
+// current one at the reveal, { as: 'reveal' } to show a different picture at the reveal.
+// Location and date from the new file's camera data fill in what the picture doesn't have yet.
+app.post('/api/sets/:id/images/:imageId/versions', photoUpload.single('image'), route(async (req, res) => {
+  const set = requireSet(req.params.id);
+  const current = set.images.find((i) => i.id === req.params.imageId);
+  if (!current) throw notFound('Picture');
+  const as = req.body.as === 'reveal' ? 'reveal' : 'guess';
+  const patch = parsePatch(set, req.body);
+  const missing = Object.fromEntries(Object.entries(patch).filter(([key]) => current[key] === null || current[key] === ''));
+  store.addVersion(set.id, current.id, await readPhoto(req), as);
+  const [image] = store.updateImages(set.id, [current.id], missing);
+  res.json(image);
+}));
+
+app.post('/api/sets/:id/images/:imageId/swap', (req, res) => {
+  requireSet(req.params.id);
+  const image = store.swapVersions(req.params.id, req.params.imageId);
+  if (!image) throw notFound('Picture with a reveal version');
+  res.json(image);
+});
+
+app.delete('/api/sets/:id/images/:imageId/reveal', (req, res) => {
+  requireSet(req.params.id);
+  const image = store.removeReveal(req.params.id, req.params.imageId);
+  if (!image) throw notFound('Picture');
+  res.json(image);
+});
+
 app.get('/api/sets/:id/files/:file', (req, res, next) => {
   const file = store.filePath(req.params.id, req.params.file);
   if (!file) throw notFound('Picture');
@@ -232,12 +261,14 @@ app.get('/api/sets/:id/files/:file', (req, res, next) => {
 
 const requireGame = (code) => games.get(String(code).toUpperCase()) ?? (() => { throw notFound('Game'); })();
 
-app.get('/api/games/:code/images/:index/:slot?', route(async (req, res) => {
+app.get('/api/games/:code/:kind(images|reveal)/:index/:slot?', route(async (req, res) => {
   const game = requireGame(req.params.code);
-  const { index, slot = 0 } = /** @type {{index: string, slot?: string}} */ (req.params);
-  const image = game.imageFor(Number(index), Number(slot));
+  const { kind, index, slot = 0 } = /** @type {{kind: string, index: string, slot?: string}} */ (req.params);
+  const reveal = kind === 'reveal';
+  // The reveal version only exists once the round is over.
+  const image = reveal ? game.revealFor(Number(index), Number(slot)) : game.imageFor(Number(index), Number(slot));
   if (!image) throw notFound('Picture');
-  const out = await sources.file(game, image);
+  const out = await sources.file(game, image, { reveal });
   if ('file' in out) return res.sendFile(out.file, { maxAge: '1h' });
   res.set('Cache-Control', 'private, max-age=3600').type('jpeg').send(out.buffer);
 }));

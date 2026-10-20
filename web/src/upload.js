@@ -29,12 +29,13 @@ export async function readPhotoInfo(file) {
  * Uploads the original file; the server rotates, shrinks, converts (HEIC) and strips metadata.
  * @param {string} url
  * @param {File} file
- * @param {{withLocation?: boolean, headers?: Record<string, string>}} [opts]
+ * @param {{withLocation?: boolean, headers?: Record<string, string>, fields?: Record<string, string>}} [opts]
  */
-export async function uploadPhoto(url, file, { withLocation = true, headers } = {}) {
+export async function uploadPhoto(url, file, { withLocation = true, headers, fields = {} } = {}) {
   const info = await readPhotoInfo(file);
   const form = new FormData();
   form.append('image', file, file.name);
+  for (const [key, value] of Object.entries(fields)) form.append(key, value);
   if (withLocation && info.lat !== undefined) {
     form.append('lat', String(info.lat));
     form.append('lng', String(info.lng));

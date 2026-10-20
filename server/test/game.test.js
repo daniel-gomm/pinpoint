@@ -255,3 +255,26 @@ test('not enough pictures for the mode gives a clear error', () => {
   assert.throws(() => game.start(host.id), /4 pictures with a date; this game needs at least 6/);
   assert.throws(() => makeGame({ mode: 'date', images: [IMAGES[4]] }).prepare(), /no pictures with a date/);
 });
+
+test('reveal versions are only served once the round is over', () => {
+  const images = [{ ...IMAGES[0], revealFile: 'a-full.jpg' }, IMAGES[1]];
+  const game = makeGame({ images, rounds: 2 });
+  const host = game.addPlayer('Host');
+  game.start(host.id);
+  const withReveal = game.rounds.findIndex((r) => r.images[0].revealFile);
+  const guessUrl = `/api/games/ABCD/images/${withReveal}/0`;
+
+  while (game.roundIndex < withReveal) {
+    game.endRoundEarly(host.id);
+    game.next(host.id);
+  }
+  assert.equal(game.revealFor(withReveal), null, 'hidden during the round');
+  assert.deepEqual(game.snapshot(host.id).round?.imageUrls, [guessUrl]);
+  assert.ok(!JSON.stringify(game.snapshot(host.id)).includes('/reveal/'));
+
+  game.endRoundEarly(host.id);
+  assert.equal(game.revealFor(withReveal)?.revealFile, 'a-full.jpg');
+  assert.deepEqual(game.snapshot(host.id).reveal?.imageUrls, [`/api/games/ABCD/reveal/${withReveal}/0`]);
+  const other = 1 - withReveal;
+  assert.equal(game.revealFor(other), null, 'pictures without a reveal version use the normal one');
+});

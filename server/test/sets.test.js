@@ -66,3 +66,39 @@ test('import rejects junk and cleans up after a bad picture', async () => {
   await assert.rejects(store.importZip(bad));
   assert.equal(store.list().length, 0, 'half-imported set removed');
 });
+
+test('reveal versions: guess on a crop, reveal the original, swap, remove, export', async () => {
+  const store = tmpStore();
+  const set = store.create('Party');
+  const image = store.addImage(set.id, { buffer: await jpeg('#f00'), caption: 'Original' });
+  const original = image.file;
+
+  // a cropped version to guess on: the original moves to the reveal
+  const cropped = store.addVersion(set.id, image.id, await jpeg('#0f0'), 'guess');
+  assert.equal(cropped.revealFile, original);
+  assert.notEqual(cropped.file, original);
+
+  // replacing the guess picture again drops the previous crop, keeps the original
+  const recropped = store.addVersion(set.id, image.id, await jpeg('#00f'), 'guess');
+  assert.equal(recropped.revealFile, original);
+  assert.ok(!fs.existsSync(store.filePath(set.id, cropped.file)), 'old crop removed');
+
+  const swapped = store.swapVersions(set.id, image.id);
+  assert.deepEqual([swapped.file, swapped.revealFile], [original, recropped.file]);
+
+  const { zip } = store.exportZip(set.id);
+  const other = tmpStore();
+  const [copy] = (await other.importZip(zip)).images;
+  assert.ok(copy.revealFile && fs.existsSync(other.filePath(other.list()[0].id, copy.revealFile)), 'reveal survives export');
+
+  const removed = store.removeReveal(set.id, image.id);
+  assert.equal(removed.revealFile, undefined);
+  assert.ok(!fs.existsSync(store.filePath(set.id, recropped.file)));
+  assert.equal(store.addVersion(set.id, 'nope', await jpeg('#fff'), 'reveal'), null);
+
+  store.addVersion(set.id, image.id, await jpeg('#fff'), 'reveal');
+  const files = () => fs.readdirSync(path.dirname(store.filePath(set.id, 'x.jpg'))).filter((f) => f.endsWith('.jpg'));
+  assert.equal(files().length, 2);
+  store.deleteImages(set.id, [image.id]);
+  assert.equal(files().length, 0, 'both versions deleted with the picture');
+});

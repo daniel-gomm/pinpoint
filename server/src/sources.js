@@ -59,12 +59,15 @@ export function createSources({ store, immich }) {
   }
 
   /**
-   * A round's picture, for sending to players.
+   * A round's picture, for sending to players. `reveal` asks for the version shown after the round.
+   * @param {any} game
+   * @param {any} image
+   * @param {{reveal?: boolean}} [opts]
    * @returns {Promise<{file: string} | {buffer: Buffer}>}
    */
-  async function file(game, image) {
+  async function file(game, image, { reveal = false } = {}) {
     if (game.settings.source !== 'immich') {
-      const file = store.filePath(game.settings.setId, image.file);
+      const file = store.filePath(game.settings.setId, reveal && image.revealFile ? image.revealFile : image.file);
       if (!file) throw new GameError('Picture not found.');
       return { file };
     }

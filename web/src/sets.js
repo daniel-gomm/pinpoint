@@ -148,7 +148,7 @@ export function setEditorView(root, setId) {
     const noDate = set.images.filter((i) => !dated(i)).length;
     const gaps = [noPlace && `${noPlace} without a location`, noDate && `${noDate} without a date`].filter(Boolean);
     status.textContent = set.images.length
-      ? `${set.images.length} pictures${gaps.length ? `, ${gaps.join(', ')}` : ', all with location and date'}`
+      ? `${set.images.length} picture${set.images.length === 1 ? '' : 's'}${gaps.length ? `, ${gaps.join(', ')}` : ', all with location and date'}`
       : '';
     thumbs.replaceChildren(...set.images.map((img) => h('li', {},
       h('button', {
@@ -160,7 +160,8 @@ export function setEditorView(root, setId) {
       h('img', { src: fileUrl(img.file), alt: img.caption || 'Picture', loading: 'lazy' }),
       h('span', { class: 'badges' },
         located(img) ? null : h('span', { class: 'badge' }, 'No place'),
-        dated(img) ? null : h('span', { class: 'badge' }, 'No date'))),
+        dated(img) ? null : h('span', { class: 'badge' }, 'No date'),
+        img.revealFile ? h('span', { class: 'badge badge-reveal', title: 'Shows a different picture after the round' }, 'Reveal') : null)),
     )));
   }
 
@@ -212,7 +213,11 @@ export function setEditorView(root, setId) {
       onChange: (e) => patch(ids, { takenAt: e.target.value ? e.target.value.slice(0, 16) : null }, e.target.value ? 'Date saved' : 'Date removed'),
     });
     detail.replaceChildren(
-      h('img', { class: 'detail-img', src: fileUrl(img.file), alt: img.caption || 'Selected picture' }),
+      img.revealFile
+        ? h('div', { class: 'detail-versions' },
+            h('figure', {}, h('img', { class: 'detail-img', src: fileUrl(img.file), alt: 'Picture players guess on' }), h('figcaption', {}, 'Players guess on')),
+            h('figure', {}, h('img', { class: 'detail-img', src: fileUrl(img.revealFile), alt: 'Picture shown after the round' }), h('figcaption', {}, 'Shown after the round')))
+        : h('img', { class: 'detail-img', src: fileUrl(img.file), alt: img.caption || 'Selected picture' }),
       h('div', { class: 'detail-fields' },
         h('div', { class: 'row' }, h('label', {}, 'Caption', caption), h('label', {}, 'Taken on', takenAt)),
         h('p', { class: located(img) ? 'muted' : 'warn' },
@@ -221,8 +226,53 @@ export function setEditorView(root, setId) {
               ? 'Placed on the map. Click the map or drag the pin to move it.'
               : `Placed at ${img.lat.toFixed(5)}, ${img.lng.toFixed(5)}. Click the map or drag the pin to move it.`
             : 'Click the map where this picture was taken.'),
+        versionTools(img),
         h('button', { class: 'btn danger subtle', type: 'button', onClick: () => removeImages(ids) }, 'Remove picture')),
     );
+  }
+
+  /** A second version of a picture: guess on a cropped or blurred one, show the full one after the round. */
+  function versionTools(img) {
+    const choose = (as, label, kind = 'btn subtle') => {
+      const input = h('input', { type: 'file', accept: IMAGE_ACCEPT, hidden: true, onChange: (e) => addVersion(img, e.target.files[0], as) });
+      return [input, h('button', { class: kind, type: 'button', onClick: () => input.click() }, label)];
+    };
+    if (!img.revealFile) {
+      return h('div', { class: 'versions' },
+        h('p', { class: 'muted' }, 'Gives too much away? Add a cropped or blurred version for players to guess on. This picture is then shown after the round.'),
+        h('div', { class: 'row-actions' },
+          choose('guess', 'Add a version to guess on'),
+          choose('reveal', 'Show a different picture after the round', 'link')));
+    }
+    return h('div', { class: 'versions' },
+      h('div', { class: 'row-actions' },
+        choose('guess', 'Replace guess picture'),
+        choose('reveal', 'Replace reveal picture'),
+        h('button', { class: 'btn subtle', type: 'button', onClick: () => changeVersions(img, 'swap') }, 'Swap'),
+        h('button', { class: 'link', type: 'button', onClick: () => changeVersions(img, 'remove') }, 'Remove reveal picture')));
+  }
+
+  async function addVersion(img, file, as) {
+    if (!file) return;
+    toast('Uploading…');
+    try {
+      const updated = await uploadPhoto(`/api/sets/${set.id}/images/${img.id}/versions`, file, { withLocation: !set.map, fields: { as } });
+      Object.assign(img, updated);
+      renderAll();
+      toast(as === 'guess' ? 'Players now guess on the new picture' : 'Reveal picture saved');
+    } catch (err) { toast(err.message, 'error'); }
+  }
+
+  async function changeVersions(img, action) {
+    try {
+      const updated = action === 'swap'
+        ? await api(`/api/sets/${set.id}/images/${img.id}/swap`, { method: 'POST' })
+        : await api(`/api/sets/${set.id}/images/${img.id}/reveal`, { method: 'DELETE' });
+      if (action === 'remove') delete img.revealFile;
+      Object.assign(img, updated);
+      renderAll();
+      toast(action === 'swap' ? 'Pictures swapped' : 'Reveal picture removed');
+    } catch (err) { toast(err.message, 'error'); }
   }
 
   function renderMapBar() {

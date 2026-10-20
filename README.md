@@ -26,6 +26,7 @@ Games survive a server restart (`docker compose restart`): players reconnect aut
 - Create a set and drop in photos (JPEG, PNG, WebP, iPhone HEIC). Location (GPS) and date/time are read from the camera data when present. Otherwise select a picture, click the map, and fill in "Taken on".
 - **Bulk editing:** Ctrl- or Shift-click several pictures to set one date for all, place them all with one click, clear fields or remove them.
 - **Custom map:** use your own image (floor plan, campus map) instead of the world map. Distances are shown in meters if you enter the real width, otherwise as a percentage of the map width.
+- **Reveal picture:** if a picture gives too much away, add a cropped or blurred version for players to guess on; the full picture is shown after the round. Or keep the picture and add a different one for the reveal. Before the round ends, the server doesn't serve the reveal picture at all.
 - **Export / import:** download a set as a zip and import it elsewhere.
 - The server re-encodes every upload (rotation, max 2400 px, JPEG), which strips all metadata, so players can't read the answer from the file.
 

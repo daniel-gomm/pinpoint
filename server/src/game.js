@@ -325,6 +325,13 @@ export class Game {
     return this.rounds[index]?.images[slot] ?? null;
   }
 
+  /** A picture's reveal version, only once its round is over. */
+  revealFor(index, slot = 0) {
+    const over = index < this.roundIndex || (index === this.roundIndex && this.phase !== PHASES.ROUND);
+    const image = over ? this.imageFor(index, slot) : null;
+    return image?.revealFile ? image : null;
+  }
+
   // ---------- views ----------
 
   standings() {
@@ -339,7 +346,9 @@ export class Game {
     return {
       index,
       answer: this.objective.answer(round.images, this.context()),
-      imageUrls: this.imageUrls(index),
+      // After the round, pictures with a reveal version (e.g. uncropped) show that one.
+      imageUrls: round.images.map((image, slot) =>
+        `/api/games/${this.code}/${image.revealFile ? 'reveal' : 'images'}/${index}/${slot}`),
       // Where the host can open the original (e.g. in Immich); other players don't get the address.
       links: viewerId === this.hostId && links.some(Boolean) ? links : null,
       guesses: this.results[index].entries
