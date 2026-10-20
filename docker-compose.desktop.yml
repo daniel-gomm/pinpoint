@@ -1,0 +1,11 @@
+# Override for Docker Desktop (macOS / Windows), where host networking can't see your LAN address.
+# The server runs on a normal bridge network instead, and invite links use PUBLIC_URL:
+#
+#   PUBLIC_URL=http://192.168.1.20:8080 docker compose -f docker-compose.yml -f docker-compose.desktop.yml up --build
+services:
+  server:
+    network_mode: bridge
+    ports:
+      - "${SERVER_PORT:-3737}:${SERVER_PORT:-3737}"
+    environment:
+      - LAN_DETECT=false

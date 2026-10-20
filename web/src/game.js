@@ -1,10 +1,13 @@
-import { h, api, toast, store, formatDistance, formatPoints, playerColor } from './util.js';
+import { h, api, toast, store, formatPoints, formatScore, ordinal, playerColor, qrSvg, lightbox } from './util.js';
 import { connect, request, rememberPlayer, rememberedPlayer, forgetPlayer } from './socket.js';
-import { createMap, pinIcon, dotIcon, nearLng, escapeHtml, L } from './map.js';
-import { createDatePicker, renderTimeline, formatDuration, formatTakenAt } from './time.js';
+import { MODES } from './modes/index.js';
+import { contributePanel } from './contribute.js';
+
+/** @typedef {import('../../shared/protocol.js').Snapshot} Snapshot */
 
 const URGENT_SECONDS = 15;
 const isLocalhost = () => ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+const PRECISION_LABEL = { minute: 'to the quarter hour', day: 'to the day', month: 'to the month', year: 'to the year' };
 
 /** Origin other players should use. Falls back to the current origin unless that is localhost. */
 async function inviteOrigin() {
@@ -20,21 +23,24 @@ async function inviteOrigin() {
 export function gameView(root, codeParam) {
   const code = codeParam.toUpperCase();
   const socket = connect();
+  /** @type {Snapshot} */
   let state = null;
   let layoutKey = null;
   let clockOffset = 0;
   let teardown = [];
   let ui = {};
 
+  const mode = () => MODES[state.settings.mode];
   const me = () => state.players.find((p) => p.id === state.you);
   const isHost = () => state.hostId === state.you;
-  const isDateMode = () => state.mode === 'date';
-  const formatOff = (distance) => (isDateMode() ? formatDuration(distance) : formatDistance(distance));
+  const isPresenter = () => state.presenter?.id === state.you;
   const serverNow = () => Date.now() + clockOffset;
+  const fmtScore = (n) => formatScore(n, state.settings.scoring);
   const colorOf = (playerId) => {
     const order = [...state.players].sort((a, b) => a.id.localeCompare(b.id));
     return playerColor(Math.max(0, order.findIndex((p) => p.id === playerId)));
   };
+  const hostName = () => state.presenter?.name ?? state.players.find((p) => p.id === state.hostId)?.name ?? 'the host';
 
   socket.on('state', onState);
   socket.on('connect', rejoin);
@@ -74,13 +80,14 @@ export function gameView(root, codeParam) {
     teardown = [];
     ui = {};
     layoutKey = null;
+    document.body.classList.remove('presenting');
   }
 
   function onState(snap) {
     if (snap.code !== code) return;
     state = snap;
     clockOffset = snap.serverNow - Date.now();
-    if (!me()) {
+    if (!me() && !isPresenter()) {
       forgetPlayer(code);
       reset();
       root.replaceChildren(h('section', { class: 'page center' },
@@ -92,6 +99,7 @@ export function gameView(root, codeParam) {
     if (key !== layoutKey) {
       reset();
       layoutKey = key;
+      document.body.classList.toggle('presenting', isPresenter());
       ({ lobby: renderLobby, round: renderRound, reveal: renderReveal, finished: renderFinished })[snap.phase]();
     }
     ui.update?.();
@@ -109,17 +117,30 @@ export function gameView(root, codeParam) {
     location.hash = '#/';
   }
 
-  function playerList({ showScores = false, showGuessed = false } = {}) {
+  function playerList({ showScores = false, showGuessed = false, showPhotos = false } = {}) {
     return h('ul', { class: 'players' }, state.players.map((p) => h('li', { class: p.connected ? '' : 'offline' },
       h('span', { class: 'swatch', style: { background: colorOf(p.id) } }),
       h('span', { class: 'name' }, p.name, p.id === state.you ? ' (you)' : '', p.id === state.hostId ? h('small', {}, ' host') : null),
       !p.connected ? h('small', { class: 'muted' }, 'offline') : null,
-      showGuessed ? h('span', { class: `guessed ${p.guessed ? 'yes' : ''}` }, p.guessed ? 'Guessed' : 'Thinking') : null,
-      showScores ? h('span', { class: 'score' }, formatPoints(p.total)) : null,
+      showPhotos ? h('small', { class: 'muted' }, `${p.photos?.ready ?? 0} picture${p.photos?.ready === 1 ? '' : 's'} ready`) : null,
+      showGuessed ? h('span', { class: `guessed ${p.guessed ? 'yes' : ''}` },
+        p.sittingOut ? 'Own picture' : p.guessed ? 'Guessed' : 'Thinking') : null,
+      showScores ? h('span', { class: 'score' }, fmtScore(p.total)) : null,
       isHost() && state.phase === 'lobby' && p.id !== state.you
         ? h('button', { class: 'link', type: 'button', onClick: () => act('game:kick', { playerId: p.id }) }, 'Remove')
         : null,
     )));
+  }
+
+  function summary() {
+    const s = state.settings;
+    const parts = [
+      `${state.totalRounds} round${state.totalRounds === 1 ? '' : 's'} of ${s.roundSeconds} seconds`,
+      s.mode === 'date' ? `dates ${PRECISION_LABEL[s.precision]}` : null,
+      s.mode === 'order' ? `${s.orderSize} pictures per round` : null,
+      s.scoring === 'placement' ? 'scored by placement' : 'scored in points',
+    ].filter(Boolean);
+    return `${parts.join(', ')}.`;
   }
 
   // ---------- Lobby ----------
@@ -127,24 +148,37 @@ export function gameView(root, codeParam) {
     let shareUrl = `${location.origin}${location.pathname}#/game/${code}`;
     const shareInput = h('input', { value: shareUrl, readonly: true, 'aria-label': 'Invite link', onFocus: (e) => e.target.select() });
     const shareHint = h('p', { class: 'hint' });
+    const qr = h('div', { class: 'qr-wrap' });
+    const setQr = () => qr.replaceChildren(qrSvg(shareUrl), h('span', {}, 'Scan to join'));
+    setQr();
     inviteOrigin().then((origin) => {
       if (origin) {
         shareUrl = `${origin}${location.pathname}#/game/${code}`;
         shareInput.value = shareUrl;
+        setQr();
       } else if (isLocalhost()) {
         shareHint.textContent = 'This link only works on this computer. Share your network address instead.';
       }
     });
     const players = h('div');
     const controls = h('div', { class: 'lobby-controls' });
-    root.replaceChildren(h('section', { class: 'lobby' },
-      h('div', { class: 'stamp', 'aria-label': `Game code ${code}` },
-        h('span', { class: 'stamp-label' }, 'Game code'),
-        h('span', { class: 'stamp-code' }, code)),
+    const bringPhotos = state.settings.source === 'players';
+    let contribute = null;
+    if (bringPhotos) {
+      contribute = contributePanel({ code, playerId: state.you, mode: state.settings.mode });
+      teardown.push(contribute.destroy);
+    }
+
+    root.replaceChildren(h('section', { class: `lobby${isPresenter() ? ' lobby-presenter' : ''}` },
+      h('div', { class: 'lobby-side' },
+        h('div', { class: 'stamp', 'aria-label': `Game code ${code}` },
+          h('span', { class: 'stamp-label' }, 'Game code'),
+          h('span', { class: 'stamp-code' }, code)),
+        qr),
       h('div', { class: 'lobby-info' },
-        h('h1', {}, state.setName),
-        h('p', { class: 'muted' },
-          `${isDateMode() ? 'Guess the date' : 'Guess the place'}: ${state.totalRounds} rounds, ${state.roundSeconds} seconds each.`),
+        h('h1', {}, bringPhotos ? 'Bring your own pictures' : state.setName),
+        h('p', { class: 'lobby-mode' }, mode().title),
+        h('p', { class: 'muted' }, summary()),
         h('div', { class: 'share' },
           shareInput,
           h('button', { class: 'btn', type: 'button', onClick: async () => {
@@ -154,43 +188,64 @@ export function gameView(root, codeParam) {
         shareHint,
         h('h2', {}, 'Players'),
         players,
+        contribute?.el,
         controls,
         h('button', { class: 'link', type: 'button', onClick: leave }, 'Leave game')),
     ));
     ui.update = () => {
-      players.replaceChildren(playerList());
+      players.replaceChildren(state.players.length
+        ? playerList({ showPhotos: bringPhotos })
+        : h('p', { class: 'muted' }, 'Nobody has joined yet. Players scan the code or open the invite link.'));
+      const n = state.players.length;
       controls.replaceChildren(isHost()
-        ? h('button', { class: 'btn primary big', type: 'button', onClick: () => act('game:start') },
-            `Start game with ${state.players.length} player${state.players.length === 1 ? '' : 's'}`)
-        : h('p', { class: 'waiting' }, 'Waiting for the host to start the game.'));
+        ? h('button', { class: 'btn primary big', type: 'button', disabled: n === 0, onClick: () => act('game:start') },
+            n ? `Start game with ${n} player${n === 1 ? '' : 's'}` : 'Waiting for players')
+        : h('p', { class: 'waiting' }, `Waiting for ${hostName()} to start the game.`));
     };
   }
 
   // ---------- Round ----------
   function renderRound() {
     const { round } = state;
-    let pending = round.myGuess ?? round.myDraft;
+    const m = mode();
+    const role = isPresenter() ? 'presenter' : round.sittingOut ? 'sitting-out' : 'player';
+    let pending = round.myGuess ?? round.myDraft ?? m.initialGuess?.(state) ?? null;
     let locked = Boolean(round.myGuess);
     let draftTimer = null;
 
     const timer = h('span', { class: 'timer' });
     const bar = h('span', { class: 'timer-bar' });
-    const lockBtn = h('button', { class: 'btn primary big', type: 'button', disabled: true, onClick: lockIn });
     const players = h('div', { class: 'round-players' });
     const hostTools = h('div');
-    const inputEl = h('div', { class: isDateMode() ? 'date-pane' : 'map guess-map' });
-    const photo = h('figure', { class: 'photo', onClick: () => photo.classList.toggle('zoomed'), title: 'Click to enlarge' },
-      h('img', { src: round.imageUrl, alt: isDateMode() ? 'When was this taken?' : 'Where was this taken?' }));
+    const photoPanel = () => h('figure', { class: 'photo', onClick: () => lightbox(round.imageUrls[0]), title: 'Click to enlarge' },
+      h('img', { src: round.imageUrls[0], alt: 'Round picture' }));
+    const photoStrip = () => h('div', { class: 'photo-strip' }, round.imageUrls.map((url, i) =>
+      h('figure', { onClick: () => lightbox(url) }, h('img', { src: url, alt: `Picture ${i + 1}` }))));
 
-    const section = h('section', { class: `round mode-${state.mode}` },
+    let main;
+    let input = null;
+    let inputEl = null;
+    const lockBtn = h('button', { class: 'btn primary big', type: 'button', disabled: true, onClick: lockIn });
+    if (role === 'player') {
+      inputEl = h('div', { class: 'picker' });
+      main = m.showsPhotos
+        ? h('div', { class: 'guess-pane wide' }, inputEl, lockBtn)
+        : [photoPanel(), h('div', { class: 'guess-pane' }, inputEl, lockBtn)];
+    } else if (role === 'presenter') {
+      // the shared screen shows the picture(s) as large as possible; players guess on their phones
+      main = m.showsPhotos ? h('div', { class: 'guess-pane wide' }, photoStrip()) : photoPanel();
+    } else {
+      const note = h('div', { class: 'presenter-note' }, h('h2', {}, 'This is your picture'),
+        h('p', {}, 'Sit back while the others guess. You get the average of their scores for this round.'));
+      main = m.showsPhotos ? h('div', { class: 'guess-pane wide' }, photoStrip(), note) : [photoPanel(), note];
+    }
+
+    const section = h('section', { class: `round mode-${state.settings.mode} role-${role}` },
       h('div', { class: 'round-bar' },
         h('strong', {}, `Round ${round.index + 1} of ${state.totalRounds}`),
         h('span', { class: 'timer-wrap' }, timer, h('span', { class: 'timer-track' }, bar)),
         h('button', { class: 'link', type: 'button', onClick: leave }, 'Leave')),
-      h('div', { class: 'round-body' },
-        photo,
-        h('div', { class: 'guess-pane' }, inputEl, lockBtn),
-        h('aside', { class: 'round-side' }, players, hostTools)),
+      h('div', { class: 'round-body' }, main, h('aside', { class: 'round-side' }, players, hostTools)),
     );
     root.replaceChildren(section);
 
@@ -200,21 +255,19 @@ export function gameView(root, codeParam) {
       pending = payload;
       refresh();
       clearTimeout(draftTimer);
-      draftTimer = setTimeout(() => request('guess:draft', payload), isDateMode() ? 300 : 0);
+      draftTimer = setTimeout(() => request('guess:draft', payload), state.settings.mode === 'date' ? 300 : 0);
     }
     teardown.push(() => clearTimeout(draftTimer));
 
-    const input = isDateMode()
-      ? createDatePicker(inputEl, { range: state.setup.range, initial: pending?.time, onChange: (time) => pick({ time }) })
-      : pinPicker(inputEl, pending, (latlng) => pick(latlng));
-    teardown.push(() => input.destroy());
+    if (inputEl) {
+      input = m.createPicker(inputEl, { state, initial: pending, color: colorOf(state.you), onPick: pick });
+      teardown.push(() => input.destroy());
+    }
 
     function refresh() {
       lockBtn.disabled = locked || !pending;
-      lockBtn.textContent = locked ? 'Guess locked in'
-        : pending ? 'Lock in guess'
-        : isDateMode() ? 'Pick a date' : 'Place a pin on the map';
-      input.setLocked(locked);
+      lockBtn.textContent = locked ? 'Guess locked in' : pending && state.settings.mode !== 'order' ? 'Lock in guess' : m.emptyPrompt;
+      input?.setLocked(locked);
     }
     refresh();
 
@@ -236,16 +289,16 @@ export function gameView(root, codeParam) {
       timer.textContent = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
       timer.classList.toggle('urgent', secs <= URGENT_SECONDS);
       section.classList.toggle('urgent', secs <= URGENT_SECONDS);
-      bar.style.transform = `scaleX(${left / (state.roundSeconds * 1000)})`;
+      bar.style.transform = `scaleX(${left / (state.settings.roundSeconds * 1000)})`;
     };
     tick();
     const interval = setInterval(tick, 250);
     teardown.push(() => clearInterval(interval));
 
     ui.update = () => {
-      const guessed = state.players.filter((p) => p.guessed).length;
+      const playing = state.players.filter((p) => p.connected && !p.sittingOut);
       players.replaceChildren(
-        h('h2', {}, `${guessed} of ${state.players.filter((p) => p.connected).length} guessed`),
+        h('h2', {}, `${state.players.filter((p) => p.guessed).length} of ${playing.length} guessed`),
         playerList({ showGuessed: true }));
       hostTools.replaceChildren(isHost()
         ? h('button', { class: 'btn subtle', type: 'button', onClick: () => act('round:end') }, 'End round now')
@@ -253,145 +306,101 @@ export function gameView(root, codeParam) {
     };
   }
 
-  function pinPicker(el, initial, onPick) {
-    const map = createMap(el);
-    let marker = null;
-    let locked = false;
-    const place = (latlng) => {
-      marker ??= L.marker(latlng, { icon: pinIcon(colorOf(state.you)), keyboard: false }).addTo(map);
-      marker.setLatLng(latlng);
-    };
-    map.on('click', (e) => {
-      if (locked) return;
-      place(e.latlng);
-      onPick({ lat: e.latlng.lat, lng: e.latlng.lng });
-    });
-    if (initial) {
-      place(initial);
-      map.setView(initial, 4);
-    }
-    return {
-      setLocked(value) {
-        locked = value;
-        el.classList.toggle('locked', value);
-      },
-      destroy: () => map.remove(),
-    };
-  }
-
   // ---------- Reveal ----------
-  /** Shows a finished round's answer and guesses; returns a cleanup function. */
-  function answerView(el, result) {
-    if (isDateMode()) {
-      el.replaceChildren();
-      renderTimeline(el, { answer: result.answer, guesses: result.guesses, colorOf });
-      return () => {};
-    }
-    const map = revealMap(el, result);
-    return () => map.remove();
-  }
-
-  function revealMap(el, result) {
-    const map = createMap(el);
-    const { answer } = result;
-    const points = [[answer.lat, answer.lng]];
-    for (const g of result.guesses) {
-      if (!g.guess) continue;
-      const lng = nearLng(g.guess.lng, answer.lng);
-      const color = colorOf(g.playerId);
-      L.polyline([[answer.lat, answer.lng], [g.guess.lat, lng]], { color, weight: 2, dashArray: '6 6', opacity: 0.9 }).addTo(map);
-      L.marker([g.guess.lat, lng], { icon: dotIcon(color, g.name) })
-        .bindTooltip(`${escapeHtml(g.name)}: ${formatDistance(g.distance)}`, { direction: 'top', offset: [0, -8] })
-        .addTo(map);
-      points.push([g.guess.lat, lng]);
-    }
-    L.marker([answer.lat, answer.lng], { icon: pinIcon('var(--pin)'), zIndexOffset: 1000 })
-      .bindTooltip(answer.caption ? escapeHtml(answer.caption) : 'Here', { direction: 'top', offset: [0, -34] })
-      .addTo(map);
-    requestAnimationFrame(() => {
-      map.invalidateSize();
-      if (points.length > 1) map.fitBounds(points, { padding: [50, 50], maxZoom: 15 });
-      else map.setView(points[0], 12);
-    });
-    return map;
+  function resultsTable(result) {
+    const placement = state.settings.scoring === 'placement';
+    return h('table', { class: 'results' },
+      h('thead', {}, h('tr', {}, h('th', {}, 'Player'), h('th', {}, 'Off by'), h('th', { class: 'num' }, 'Round'), h('th', { class: 'num' }, 'Total'))),
+      h('tbody', {}, result.guesses.map((g) => h('tr', { class: g.playerId === state.you ? 'me' : '' },
+        h('td', {}, h('span', { class: 'swatch', style: { background: colorOf(g.playerId) } }), g.name),
+        h('td', {}, g.sitOut ? h('span', { class: 'muted' }, 'Own picture') : mode().formatOff(g.distance, state),
+          g.guess && !g.locked ? h('small', { class: 'muted', title: 'Picked but not locked in before time ran out' }, ' unlocked') : null),
+        h('td', { class: 'num', title: placement ? `${formatPoints(g.points)} points` : '' },
+          placement && g.rank ? h('small', { class: 'muted' }, `${ordinal(g.rank)} `) : null,
+          `+${fmtScore(g.score)}`),
+        h('td', { class: 'num' }, fmtScore(state.players.find((p) => p.id === g.playerId)?.total ?? 0)),
+      ))));
   }
 
   function renderReveal() {
     const result = state.reveal;
-    const mapEl = h('div', { class: isDateMode() ? 'panel reveal-timeline' : 'map reveal-map' });
+    const m = mode();
+    const answerEl = h('div');
     const side = h('aside', { class: 'reveal-side' });
-    root.replaceChildren(h('section', { class: 'reveal' },
+    root.replaceChildren(h('section', { class: `reveal mode-${state.settings.mode}` },
       h('div', { class: 'round-bar' },
         h('strong', {}, `Round ${result.index + 1} of ${state.totalRounds} result`),
         h('button', { class: 'link', type: 'button', onClick: leave }, 'Leave')),
-      h('div', { class: 'reveal-body' }, mapEl, side)));
-    teardown.push(answerView(mapEl, result));
+      h('div', { class: 'reveal-body' }, answerEl, side)));
+    teardown.push(m.renderAnswer(answerEl, result, { state, colorOf }));
 
     ui.update = () => {
       const last = result.index + 1 >= state.totalRounds;
-      const host = state.players.find((p) => p.id === state.hostId);
-      side.replaceChildren(
-        h('figure', { class: 'reveal-photo' },
-          h('img', { src: state.round.imageUrl, alt: result.answer.caption || 'This round’s picture' }),
+      side.replaceChildren(...[
+        m.showsPhotos ? null : h('figure', { class: 'reveal-photo' },
+          h('img', { src: result.imageUrls[0], alt: result.answer.caption || 'This round’s picture', onClick: () => lightbox(result.imageUrls[0]) }),
           result.answer.caption ? h('figcaption', {}, result.answer.caption) : null,
-          isDateMode() ? h('p', { class: 'taken-at' }, `Taken ${formatTakenAt(result.answer.time)}`) : null),
-        h('table', { class: 'results' },
-          h('thead', {}, h('tr', {}, h('th', {}, 'Player'), h('th', {}, 'Off by'), h('th', {}, 'Round'), h('th', {}, 'Total'))),
-          h('tbody', {}, result.guesses.map((g) => h('tr', { class: g.playerId === state.you ? 'me' : '' },
-            h('td', {}, h('span', { class: 'swatch', style: { background: colorOf(g.playerId) } }), g.name),
-            h('td', {}, formatOff(g.distance),
-              g.guess && !g.locked ? h('small', { class: 'muted', title: 'Picked but not locked in before time ran out' }, ' unlocked') : null),
-            h('td', { class: 'num' }, `+${formatPoints(g.score)}`),
-            h('td', { class: 'num' }, formatPoints(state.players.find((p) => p.id === g.playerId)?.total ?? 0)),
-          )))),
+          m.answerNote?.(result, state)),
+        resultsTable(result),
         isHost()
           ? h('button', { class: 'btn primary big', type: 'button', onClick: () => act('round:next') },
               last ? 'Show final scores' : 'Next round')
-          : h('p', { class: 'waiting' }, `Waiting for ${host?.name ?? 'the host'} to continue.`),
-      );
+          : h('p', { class: 'waiting' }, `Waiting for ${hostName()} to continue.`),
+      ].filter(Boolean));
     };
   }
 
   // ---------- Finished ----------
   function renderFinished() {
     const ranked = state.players;
-    const podium = ranked.slice(0, 3);
-    const roundScore = (round, playerId) => round.guesses.find((g) => g.playerId === playerId);
-    const mapEl = h('div', { class: isDateMode() ? 'panel recap-timeline' : 'map recap-map' });
+    const placement = state.settings.scoring === 'placement';
+    const m = mode();
+    const entryOf = (round, playerId) => round.guesses.find((g) => g.playerId === playerId);
+    const answerEl = h('div');
     let recap = 0;
     let cleanupRecap = null;
     const recapLabel = h('span');
     const showRecap = (i) => {
       recap = (i + state.history.length) % state.history.length;
       cleanupRecap?.();
-      cleanupRecap = answerView(mapEl, state.history[recap]);
-      recapLabel.textContent = `Round ${recap + 1}${state.history[recap].answer.caption ? `: ${state.history[recap].answer.caption}` : ''}`;
+      answerEl.replaceChildren();
+      cleanupRecap = m.renderAnswer(answerEl, state.history[recap], { state, colorOf });
+      const caption = state.history[recap].answer.caption;
+      recapLabel.textContent = `Round ${recap + 1}${caption ? `: ${caption}` : ''}`;
     };
+    const unit = (n) => (placement ? `placement point${n === 1 ? '' : 's'}` : `point${n === 1 ? '' : 's'}`);
 
     root.replaceChildren(h('section', { class: 'finished' },
       h('h1', {}, ranked[0] ? `${ranked[0].name} wins` : 'Game over'),
-      h('ol', { class: 'podium' }, podium.map((p, i) => h('li', { class: `place-${i + 1}` },
-        h('span', { class: 'place' }, ['1st', '2nd', '3rd'][i]),
+      h('ol', { class: 'podium' }, ranked.slice(0, 3).map((p, i) => h('li', { class: `place-${i + 1}` },
+        h('span', { class: 'place' }, ordinal(i + 1)),
         h('strong', {}, p.name),
-        h('span', { class: 'score' }, `${formatPoints(p.total)} points`)))),
+        h('span', { class: 'score' }, `${fmtScore(p.total)} ${unit(p.total)}`)))),
+      placement ? h('p', { class: 'muted' }, 'Each round, you get a point for every player you were closer than. Ties are broken by points.') : null,
       h('div', { class: 'table-wrap' }, h('table', { class: 'results breakdown' },
         h('thead', {}, h('tr', {}, h('th', {}, 'Player'),
           state.history.map((r) => h('th', { class: 'num' }, `R${r.index + 1}`)),
-          h('th', { class: 'num' }, 'Total'))),
+          h('th', { class: 'num' }, 'Total'),
+          placement ? h('th', { class: 'num' }, 'Points') : null)),
         h('tbody', {}, ranked.map((p) => h('tr', { class: p.id === state.you ? 'me' : '' },
           h('td', {}, h('span', { class: 'swatch', style: { background: colorOf(p.id) } }), p.name),
           state.history.map((r) => {
-            const g = roundScore(r, p.id);
-            return h('td', { class: 'num', title: g?.guess ? formatOff(g.distance) : 'No guess' }, g?.guess ? formatPoints(g.score) : '–');
+            const g = entryOf(r, p.id);
+            const title = !g ? '' : g.sitOut ? 'Own picture (average of the others)' : g.guess ? m.formatOff(g.distance, state) : 'No guess';
+            return h('td', { class: `num${g?.sitOut ? ' muted' : ''}`, title }, g && (g.guess || g.sitOut) ? fmtScore(g.score) : '–');
           }),
-          h('td', { class: 'num total' }, formatPoints(p.total))))))),
+          h('td', { class: 'num total' }, fmtScore(p.total)),
+          placement ? h('td', { class: 'num muted' }, formatPoints(p.points)) : null))))),
       h('div', { class: 'recap' },
         h('div', { class: 'recap-nav' },
           h('button', { class: 'btn', type: 'button', onClick: () => showRecap(recap - 1), 'aria-label': 'Previous round' }, 'Previous'),
           recapLabel,
           h('button', { class: 'btn', type: 'button', onClick: () => showRecap(recap + 1), 'aria-label': 'Next round' }, 'Next')),
-        mapEl),
-      h('p', {}, h('a', { class: 'btn primary', href: '#/', onClick: () => forgetPlayer(code) }, 'Back to start')),
+        answerEl),
+      h('div', { class: 'finish-actions' },
+        isHost() ? h('button', { class: 'btn primary', type: 'button', onClick: () => act('game:restart') }, 'Play again with everyone') : null,
+        h('a', { class: `btn${isHost() ? '' : ' primary'}`, href: '#/', onClick: () => { request('game:leave'); forgetPlayer(code); } }, 'Back to start')),
+      isHost() ? null : h('p', { class: 'muted' }, `${hostName()} can start another game with everyone; stay on this page to join in.`),
     ));
     showRecap(0);
     teardown.push(() => cleanupRecap?.());

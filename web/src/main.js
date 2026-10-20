@@ -3,6 +3,7 @@ import { homeView } from './home.js';
 import { setListView, setEditorView } from './sets.js';
 import { gameView } from './game.js';
 
+/** @type {Array<[RegExp, (root: HTMLElement, ...params: string[]) => void | (() => void)]>} */
 const routes = [
   [/^#\/?$/, homeView],
   [/^#\/sets\/?$/, setListView],

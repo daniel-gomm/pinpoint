@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { GameError } from './errors.js';
 import { MODES } from './modes.js';
+import { placements } from './scoring.js';
 
 export const MAX_PLAYERS = 30;
 // A page reload briefly disconnects a player; don't end the round on them in the meantime.
@@ -9,83 +10,102 @@ export const PHASES = { LOBBY: 'lobby', ROUND: 'round', REVEAL: 'reveal', FINISH
 
 export { GameError };
 
-function shuffle(items) {
-  const a = [...items];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = crypto.randomInt(i + 1);
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
-}
+/** @typedef {import('../../shared/protocol.js').GameSettings} GameSettings */
+/** @typedef {import('../../shared/protocol.js').Snapshot} Snapshot */
+/** @typedef {{ set: {id: string, name: string, map?: any}, images: any[] }} Pool */
+
+const READY_HINT = { location: 'a location', date: 'a date', order: 'a date' };
 
 export class Game {
   /**
    * @param {object} opts
    * @param {string} opts.code
-   * @param {{id: string, name: string}} opts.set
-   * @param {'location' | 'date'} [opts.mode] what players guess
-   * @param {Array<{id, lat, lng, takenAt, caption}>} opts.images the set's pictures; rounds use those ready for the mode
-   * @param {number} opts.rounds
-   * @param {number} opts.roundSeconds
-   * @param {number} [opts.scale] overrides the field size (km for location, hours for date)
-   * @param {() => void} opts.onChange called whenever clients should get a fresh snapshot
+   * @param {GameSettings} opts.settings
+   * @param {() => Pool} opts.loadPool the pictures to play with, read when a game (re)starts
+   * @param {() => void} [opts.onChange] called whenever clients should get a fresh snapshot
+   * @param {() => number} [opts.now]
    */
-  constructor({ code, set, mode = 'location', images, rounds, roundSeconds, scale, onChange, now = Date.now }) {
-    this.objective = MODES[mode];
+  constructor({ code, settings, loadPool, onChange, now = Date.now }) {
+    this.objective = MODES[settings.mode];
     if (!this.objective) throw new GameError('Unknown game mode.');
-    const ready = images.filter(this.objective.isReady);
-    if (ready.length === 0) {
-      throw new GameError(`This picture set has no pictures with a ${mode === 'date' ? 'date' : 'location'} yet.`);
-    }
     this.code = code;
-    this.mode = mode;
-    this.setId = set.id;
-    this.setName = set.name;
-    this.roundSeconds = roundSeconds;
-    this.scale = scale || this.objective.defaultScale(ready);
-    // Derived from every ready picture, not just the drawn rounds, so it says less about them.
-    this.setup = this.objective.setup(ready, now());
-    this.images = shuffle(ready).slice(0, Math.max(1, Math.min(rounds, ready.length)));
+    this.settings = settings;
+    this.loadPool = loadPool;
     this.onChange = onChange;
     this.now = now;
 
     this.phase = PHASES.LOBBY;
+    /** @type {Map<string, {id: string, name: string, connected: boolean, total: number, points: number}>} */
     this.players = new Map();
+    /** @type {{id: string, name: string, connected: boolean} | null} host who presents but doesn't play */
+    this.presenter = null;
     this.hostId = null;
+    this.setName = '';
+    this.scale = settings.scale ?? null;
+    this.setup = null;
+    /** @type {Array<{images: any[], sitOut: string[]}>} */
+    this.rounds = [];
     this.roundIndex = -1;
     this.deadline = null;
     this.guesses = new Map();
     this.drafts = new Map();
     this.results = [];
+    /** picture ids from earlier games in this lobby; a rematch prefers new ones */
+    this.played = new Set();
+    /** @type {Map<string, {count: number, ready: number}>} pictures each player added */
+    this.contributions = new Map();
     this.timer = null;
     this.graceTimers = new Map();
     this.lastActivity = now();
   }
 
+  // ---------- people ----------
+
   addPlayer(name) {
     if (this.phase !== PHASES.LOBBY) throw new GameError('This game has already started.');
     if (this.players.size >= MAX_PLAYERS) throw new GameError('This game is full.');
-    const clean = String(name ?? '').trim().slice(0, 24);
-    if (!clean) throw new GameError('Enter a name to join.');
-    const taken = [...this.players.values()].some((p) => p.name.toLowerCase() === clean.toLowerCase());
-    if (taken) throw new GameError(`Someone is already called “${clean}”. Pick another name.`);
-
-    const player = { id: crypto.randomUUID(), name: clean, connected: true, total: 0 };
+    const clean = this.checkName(name);
+    const player = { id: crypto.randomUUID(), name: clean, connected: true, total: 0, points: 0 };
     this.players.set(player.id, player);
-    this.hostId ??= player.id;
+    if (!this.settings.presenter) this.hostId ??= player.id;
     this.touch();
     return player;
   }
 
-  setConnected(playerId, connected) {
-    const player = this.players.get(playerId);
-    if (!player) return;
-    player.connected = connected;
-    clearTimeout(this.graceTimers.get(playerId));
-    this.graceTimers.delete(playerId);
-    if (!connected) {
-      this.graceTimers.set(playerId, setTimeout(() => {
-        this.graceTimers.delete(playerId);
+  /** The host of a presenter game: runs the show on a shared screen and doesn't guess. */
+  addPresenter(name) {
+    if (this.hostId) throw new GameError('This game already has a host.');
+    this.presenter = { id: crypto.randomUUID(), name: this.checkName(name), connected: true };
+    this.hostId = this.presenter.id;
+    this.touch();
+    return this.presenter;
+  }
+
+  checkName(name) {
+    const clean = String(name ?? '').trim().slice(0, 24);
+    if (!clean) throw new GameError('Enter a name to join.');
+    const names = [...this.players.values(), ...(this.presenter ? [this.presenter] : [])].map((p) => p.name.toLowerCase());
+    if (names.includes(clean.toLowerCase())) throw new GameError(`Someone is already called “${clean}”. Pick another name.`);
+    return clean;
+  }
+
+  isMember(id) {
+    return this.players.has(id) || this.presenter?.id === id;
+  }
+
+  nameOf(id) {
+    return this.players.get(id)?.name ?? (this.presenter?.id === id ? this.presenter.name : 'Left the game');
+  }
+
+  setConnected(id, connected) {
+    const person = this.players.get(id) ?? (this.presenter?.id === id ? this.presenter : null);
+    if (!person) return;
+    person.connected = connected;
+    clearTimeout(this.graceTimers.get(id));
+    this.graceTimers.delete(id);
+    if (!connected && this.players.has(id)) {
+      this.graceTimers.set(id, setTimeout(() => {
+        this.graceTimers.delete(id);
         this.maybeEndRound();
       }, DISCONNECT_GRACE_MS));
     }
@@ -104,21 +124,68 @@ export class Game {
     this.maybeEndRound();
   }
 
+  setContributions(counts) {
+    this.contributions = counts;
+    this.touch();
+  }
+
+  // ---------- flow ----------
+
+  /** Draws the rounds from the current pictures. Throws if there aren't enough. */
+  prepare() {
+    const { set, images } = this.loadPool();
+    const pool = images.filter((i) => this.objective.isReady(i));
+    const needed = this.objective.minPool(this.settings);
+    if (pool.length < needed) {
+      const what = this.settings.source === 'players' ? 'The players have added' : 'This picture set has';
+      throw new GameError(needed > 1
+        ? `${what} ${pool.length} pictures with ${READY_HINT[this.settings.mode]}; this game needs at least ${needed}.`
+        : `${what} no pictures with ${READY_HINT[this.settings.mode]} yet.`);
+    }
+    const ctx = { settings: this.settings, set, now: this.now(), code: this.code };
+    this.setName = set.name;
+    this.scale = this.settings.scale || this.objective.defaultScale(pool, ctx);
+    // Derived from every ready picture, not just the drawn rounds, so it says less about them.
+    this.setup = this.objective.setup(pool, ctx);
+    this.rounds = this.objective
+      .drawRounds(pool, this.settings.rounds, this.settings, this.played)
+      .map((roundImages) => ({ images: roundImages, sitOut: this.objective.sitOut(roundImages) }));
+    return this.rounds.length;
+  }
+
   start(byId) {
     this.requireHost(byId);
     if (this.phase !== PHASES.LOBBY) throw new GameError('The game has already started.');
+    if (this.players.size === 0) throw new GameError('Wait for at least one player to join.');
+    this.prepare();
     this.startRound();
   }
 
   next(byId) {
     this.requireHost(byId);
     if (this.phase !== PHASES.REVEAL) throw new GameError('Wait for the round to finish.');
-    if (this.roundIndex + 1 >= this.images.length) {
+    if (this.roundIndex + 1 >= this.rounds.length) {
       this.phase = PHASES.FINISHED;
       this.touch();
     } else {
       this.startRound();
     }
+  }
+
+  /** Back to the lobby with the same players for another game. */
+  restart(byId) {
+    this.requireHost(byId);
+    if (this.phase !== PHASES.FINISHED) throw new GameError('Finish this game first.');
+    for (const r of this.rounds) for (const image of r.images) this.played.add(image.id);
+    for (const p of this.players.values()) {
+      p.total = 0;
+      p.points = 0;
+    }
+    this.rounds = [];
+    this.results = [];
+    this.roundIndex = -1;
+    this.phase = PHASES.LOBBY;
+    this.touch();
   }
 
   endRoundEarly(byId) {
@@ -133,7 +200,7 @@ export class Game {
     this.maybeEndRound();
   }
 
-  /** A pin placed but not locked in yet. It counts if the round ends before the player locks in. */
+  /** A pick that isn't locked in yet. It counts if the round ends before the player locks in. */
   setDraft(playerId, payload) {
     this.drafts.set(playerId, this.checkGuess(playerId, payload));
     this.lastActivity = this.now();
@@ -141,9 +208,18 @@ export class Game {
 
   checkGuess(playerId, payload) {
     if (this.phase !== PHASES.ROUND) throw new GameError('There is no round in progress.');
-    if (!this.players.has(playerId)) throw new GameError('You are not part of this game.');
+    if (!this.players.has(playerId)) throw new GameError('Only players can guess.');
+    if (this.currentRound().sitOut.includes(playerId)) throw new GameError('This is your picture, so you sit this round out.');
     if (this.guesses.has(playerId)) throw new GameError('You already guessed this round.');
-    return this.objective.parseGuess(payload ?? {}, this.setup);
+    return this.objective.parseGuess(payload ?? {}, this.context());
+  }
+
+  context() {
+    return { settings: this.settings, setup: this.setup, code: this.code };
+  }
+
+  currentRound() {
+    return this.rounds[this.roundIndex];
   }
 
   startRound() {
@@ -151,40 +227,74 @@ export class Game {
     this.phase = PHASES.ROUND;
     this.guesses = new Map();
     this.drafts = new Map();
-    this.deadline = this.now() + this.roundSeconds * 1000;
-    clearTimeout(this.timer);
-    this.timer = setTimeout(() => this.endRound(), this.roundSeconds * 1000);
+    this.deadline = this.now() + this.settings.roundSeconds * 1000;
+    this.armTimer();
     this.touch();
+    this.maybeEndRound();
+  }
+
+  armTimer() {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.endRound(), Math.max(0, this.deadline - this.now()));
   }
 
   maybeEndRound() {
     if (this.phase !== PHASES.ROUND) return;
+    const { sitOut } = this.currentRound();
     // Players who just dropped out may be reloading, so they still count for a few seconds.
-    const active = [...this.players.values()].filter((p) => p.connected || this.graceTimers.has(p.id));
-    if (active.length > 0 && active.every((p) => this.guesses.has(p.id))) this.endRound();
+    const active = [...this.players.values()].filter((p) =>
+      !sitOut.includes(p.id) && (p.connected || this.graceTimers.has(p.id)));
+    // A round where every remaining player sits out (their own picture) has nothing to wait for.
+    if ((active.length > 0 || sitOut.length > 0) && active.every((p) => this.guesses.has(p.id))) this.endRound();
   }
 
   endRound() {
     if (this.phase !== PHASES.ROUND) return;
     clearTimeout(this.timer);
     this.timer = null;
-    const answer = this.images[this.roundIndex];
-    const guesses = [...this.players.values()].map((player) => {
+    const round = this.currentRound();
+    const ctx = this.context();
+
+    const playing = [...this.players.values()].filter((p) => !round.sitOut.includes(p.id));
+    /** @type {any[]} */
+    const entries = playing.map((player) => {
       const locked = this.guesses.has(player.id);
-      const guess = this.guesses.get(player.id) ?? this.drafts.get(player.id);
-      if (!guess) return { playerId: player.id, guess: null, locked: false, distance: null, score: 0 };
-      const distance = this.objective.distance(guess, answer);
-      return { playerId: player.id, guess, locked, distance, score: this.objective.score(distance, this.scale) };
+      const guess = this.guesses.get(player.id) ?? this.drafts.get(player.id) ?? null;
+      const distance = guess ? this.objective.distance(guess, round.images, ctx) : null;
+      const points = guess ? this.objective.score(distance, this.scale, ctx) : 0;
+      return { playerId: player.id, sitOut: false, guess, locked: guess ? locked : false, distance, points };
     });
-    for (const g of guesses) this.players.get(g.playerId).total += g.score;
-    this.results.push({ answer, guesses });
+    placements(entries).forEach((p, i) => Object.assign(entries[i], p));
+    for (const e of entries) e.score = this.settings.scoring === 'placement' ? e.placement : e.points;
+
+    // Sitting out shouldn't cost you: you get the average of everyone who played.
+    const avg = (key, step) => {
+      if (!entries.length) return 0;
+      const mean = entries.reduce((sum, e) => sum + e[key], 0) / entries.length;
+      return Math.round(mean / step) * step;
+    };
+    for (const player of this.players.values()) {
+      if (!round.sitOut.includes(player.id)) continue;
+      const points = avg('points', 1);
+      entries.push({
+        playerId: player.id, sitOut: true, guess: null, locked: false, distance: null, points, placement: null, rank: null,
+        score: this.settings.scoring === 'placement' ? avg('placement', 0.5) : points,
+      });
+    }
+
+    for (const e of entries) {
+      const player = this.players.get(e.playerId);
+      player.total += e.score;
+      player.points += e.points;
+    }
+    this.results.push({ entries });
     this.phase = PHASES.REVEAL;
     this.deadline = null;
     this.touch();
   }
 
-  requireHost(playerId) {
-    if (playerId !== this.hostId) throw new GameError('Only the host can do that.');
+  requireHost(id) {
+    if (id !== this.hostId) throw new GameError('Only the host can do that.');
   }
 
   touch() {
@@ -198,64 +308,133 @@ export class Game {
     this.onChange = null;
   }
 
-  imageForRound(index) {
+  imageFor(index, slot = 0) {
     if (index < 0 || index > this.roundIndex) return null;
-    return this.images[index];
+    return this.rounds[index]?.images[slot] ?? null;
   }
 
-  /** What one player is allowed to see. Never leaks the answer of a running round. */
-  snapshot(playerId) {
-    const nameOf = (id) => this.players.get(id)?.name ?? 'Left the game';
-    const publicAnswer = (a) => ({ ...this.objective.answer(a), caption: a.caption });
-    const publicResult = (r, index) => ({
-      index,
-      answer: publicAnswer(r.answer),
-      guesses: r.guesses
-        .map((g) => ({ ...g, name: nameOf(g.playerId) }))
-        .sort((a, b) => b.score - a.score),
-    });
+  // ---------- views ----------
 
-    const snap = {
+  standings() {
+    return [...this.players.values()]
+      .sort((a, b) => b.total - a.total || b.points - a.points || a.name.localeCompare(b.name));
+  }
+
+  publicResult(index) {
+    const round = this.rounds[index];
+    const last = (e) => (e.sitOut ? 1 : 0);
+    return {
+      index,
+      answer: this.objective.answer(round.images, this.context()),
+      imageUrls: this.imageUrls(index),
+      guesses: this.results[index].entries
+        .map((e) => ({ ...e, name: this.nameOf(e.playerId) }))
+        .sort((a, b) => last(a) - last(b) || b.score - a.score || b.points - a.points),
+    };
+  }
+
+  imageUrls(index) {
+    return this.rounds[index].images.map((_, slot) => `/api/games/${this.code}/images/${index}/${slot}`);
+  }
+
+  /**
+   * What one person is allowed to see. Never leaks the answer of a running round.
+   * @returns {Snapshot}
+   */
+  snapshot(viewerId) {
+    const s = this.settings;
+    const inRound = this.phase === PHASES.ROUND;
+    const round = this.roundIndex >= 0 ? this.rounds[this.roundIndex] : null;
+    return {
       code: this.code,
       setName: this.setName,
-      phase: this.phase,
-      you: playerId,
+      phase: /** @type {Snapshot['phase']} */ (this.phase),
+      you: viewerId,
       hostId: this.hostId,
-      totalRounds: this.images.length,
-      roundSeconds: this.roundSeconds,
-      mode: this.mode,
+      presenter: this.presenter ? { id: this.presenter.id, name: this.presenter.name, connected: this.presenter.connected } : null,
+      settings: {
+        mode: s.mode, scoring: s.scoring, rounds: s.rounds, roundSeconds: s.roundSeconds,
+        precision: s.precision, orderSize: s.orderSize, presenter: s.presenter, source: s.source,
+      },
+      totalRounds: this.rounds.length || s.rounds,
       scale: this.scale,
       setup: this.setup,
       serverNow: this.now(),
-      players: [...this.players.values()]
-        .map((p) => ({
-          id: p.id,
-          name: p.name,
-          connected: p.connected,
-          total: p.total,
-          guessed: this.phase === PHASES.ROUND && this.guesses.has(p.id),
-        }))
-        .sort((a, b) => b.total - a.total || a.name.localeCompare(b.name)),
-      round: null,
-      reveal: null,
-      history: null,
-    };
-
-    if (this.roundIndex >= 0) {
-      snap.round = {
+      players: this.standings().map((p) => ({
+        id: p.id,
+        name: p.name,
+        connected: p.connected,
+        total: p.total,
+        points: p.points,
+        guessed: inRound && this.guesses.has(p.id),
+        sittingOut: inRound && round.sitOut.includes(p.id),
+        photos: this.contributions.get(p.id) ?? null,
+      })),
+      round: round && {
         index: this.roundIndex,
-        imageUrl: `/api/games/${this.code}/images/${this.roundIndex}`,
+        imageUrls: this.imageUrls(this.roundIndex),
         deadline: this.deadline,
-        myGuess: this.phase === PHASES.ROUND ? this.guesses.get(playerId) ?? null : null,
-        myDraft: this.phase === PHASES.ROUND ? this.drafts.get(playerId) ?? null : null,
-      };
-    }
-    if (this.phase === PHASES.REVEAL) {
-      snap.reveal = publicResult(this.results[this.roundIndex], this.roundIndex);
-    }
-    if (this.phase === PHASES.FINISHED) {
-      snap.history = this.results.map(publicResult);
-    }
-    return snap;
+        sittingOut: round.sitOut.includes(viewerId),
+        myGuess: inRound ? this.guesses.get(viewerId) ?? null : null,
+        myDraft: inRound ? this.drafts.get(viewerId) ?? null : null,
+      },
+      reveal: this.phase === PHASES.REVEAL ? this.publicResult(this.roundIndex) : null,
+      history: this.phase === PHASES.FINISHED ? this.results.map((_, i) => this.publicResult(i)) : null,
+    };
+  }
+
+  // ---------- persistence ----------
+
+  toJSON() {
+    return {
+      code: this.code,
+      settings: this.settings,
+      phase: this.phase,
+      players: [...this.players.values()],
+      presenter: this.presenter,
+      hostId: this.hostId,
+      setName: this.setName,
+      scale: this.scale,
+      setup: this.setup,
+      rounds: this.rounds,
+      roundIndex: this.roundIndex,
+      deadline: this.deadline,
+      guesses: [...this.guesses],
+      drafts: [...this.drafts],
+      results: this.results,
+      played: [...this.played],
+      contributions: [...this.contributions],
+      lastActivity: this.lastActivity,
+    };
+  }
+
+  /**
+   * Rebuilds a saved game. Everyone starts disconnected; a running round keeps its deadline.
+   * @param {any} data from toJSON()
+   * @param {{loadPool: () => Pool, onChange?: () => void, now?: () => number}} opts
+   */
+  static fromJSON(data, { loadPool, onChange, now = Date.now }) {
+    const game = new Game({ code: data.code, settings: data.settings, loadPool, now });
+    Object.assign(game, {
+      phase: data.phase,
+      presenter: data.presenter && { ...data.presenter, connected: false },
+      hostId: data.hostId,
+      setName: data.setName,
+      scale: data.scale,
+      setup: data.setup,
+      rounds: data.rounds,
+      roundIndex: data.roundIndex,
+      deadline: data.deadline,
+      guesses: new Map(data.guesses),
+      drafts: new Map(data.drafts),
+      results: data.results,
+      played: new Set(data.played),
+      contributions: new Map(data.contributions),
+      lastActivity: data.lastActivity,
+    });
+    for (const p of data.players) game.players.set(p.id, { ...p, connected: false });
+    game.onChange = onChange;
+    if (game.phase === PHASES.ROUND) game.armTimer();
+    return game;
   }
 }

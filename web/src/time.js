@@ -2,25 +2,38 @@
 // always formatted in UTC so every viewer sees the same clock time.
 import { h } from './util.js';
 
+/** @typedef {import('../../shared/protocol.js').Precision} Precision */
+
 export const MINUTE = 60 * 1000;
 export const HOUR = 60 * MINUTE;
 export const DAY = 24 * HOUR;
 const SLOT = 15 * MINUTE;
+const PERIOD_HOURS = { day: 24, month: 730.5, year: 8766 };
 
 const fmt = (opts) => new Intl.DateTimeFormat(undefined, { timeZone: 'UTC', ...opts });
-const longDate = fmt({ weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
+const FORMATS = {
+  day: fmt({ weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' }),
+  month: fmt({ month: 'long', year: 'numeric' }),
+  year: fmt({ year: 'numeric' }),
+};
 const clock = fmt({ hour: '2-digit', minute: '2-digit' });
 
-export const formatDay = (ms) => longDate.format(ms);
 export const formatClock = (ms) => clock.format(ms);
-export const formatTakenAt = (ms) => `${formatDay(ms)}, ${formatClock(ms)}`;
+/** A moment shown as precisely as the game asks for. */
+export function formatAt(ms, precision = 'minute') {
+  if (precision === 'minute') return `${FORMATS.day.format(ms)}, ${clock.format(ms)}`;
+  return FORMATS[precision].format(ms);
+}
 
-/** "2024-07-14T15:30" <-> ms */
-export const parseTakenAt = (value) => (value ? Date.parse(`${value}:00Z`) : NaN);
 export const toTakenAt = (ms) => new Date(ms).toISOString().slice(0, 16);
 
-export function formatDuration(hours) {
+/** How far off a date guess was, in the unit of the game's precision. */
+export function formatDateOff(hours, precision = 'minute') {
   if (hours === null || hours === undefined) return 'No guess';
+  if (precision !== 'minute') {
+    const n = Math.round(hours / PERIOD_HOURS[precision]);
+    return n === 0 ? `Right ${precision}` : `${n} ${precision}${n === 1 ? '' : 's'}`;
+  }
   const mins = Math.round(hours * 60);
   if (mins < 60) return `${mins} min`;
   if (hours < 48) {
@@ -34,6 +47,25 @@ export function formatDuration(hours) {
   return `${(days / 365.25).toFixed(1)} years`;
 }
 
+// ---------- calendar units ----------
+// The picker moves in whole periods; 'minute' precision picks a day plus a 15-minute slot.
+
+const unitOf = (precision) => (precision === 'minute' ? 'day' : precision);
+function periodIndex(ms, unit) {
+  const d = new Date(ms);
+  if (unit === 'year') return d.getUTCFullYear();
+  if (unit === 'month') return d.getUTCFullYear() * 12 + d.getUTCMonth();
+  return Math.floor(ms / DAY);
+}
+function periodStart(index, unit) {
+  if (unit === 'year') return Date.UTC(index, 0, 1);
+  if (unit === 'month') return Date.UTC(Math.floor(index / 12), index % 12, 1);
+  return index * DAY;
+}
+
+// ---------- axis ----------
+
+/** @type {Array<['hour' | 'day' | 'month' | 'year', number]>} */
 const STEPS = [
   ['hour', 1], ['hour', 3], ['hour', 6], ['hour', 12], ['day', 1], ['day', 2], ['day', 7],
   ['month', 1], ['month', 3], ['month', 6], ['year', 1], ['year', 2], ['year', 5],
@@ -48,7 +80,7 @@ const LABEL = {
 
 /** Calendar-aligned axis ticks between start and end, at most roughly `max` of them. */
 export function timeTicks(start, end, max = 7) {
-  const [unit, n] = STEPS.find(([u, k]) => (end - start) / (APPROX[u] * k) <= max) ?? STEPS.at(-1);
+  const [unit, n] = STEPS.find(([u, k]) => (end - start) / (APPROX[u] * k) <= max) ?? STEPS[STEPS.length - 1];
   const d = new Date(start);
   d.setUTCMinutes(0, 0, 0);
   if (unit === 'hour') d.setUTCHours(Math.floor(d.getUTCHours() / n) * n);
@@ -80,103 +112,146 @@ function axis(start, end, max) {
     timeTicks(start, end, max).map(({ t, label }) => h('span', { style: { left: `${pct(t)}%` } }, label)));
 }
 
+// ---------- picker ----------
+
+/** @type {Record<Precision, Array<['day' | 'month' | 'year', number]>>} */
+const STEPPERS = {
+  minute: [['year', 1], ['month', 1], ['day', 1]],
+  day: [['year', 1], ['month', 1], ['day', 1]],
+  month: [['year', 1], ['month', 1]],
+  year: [['year', 10], ['year', 1]],
+};
+
 /**
- * Day slider across the game's range, plus steppers and a time-of-day slider.
- * Stays empty until the player touches it, so an untouched picker never counts as a guess.
+ * Slider over the game's timeline in steps of the precision, plus steppers, an exact input and
+ * (for 'minute' precision) a time-of-day slider. Stays empty until the player touches it, so an
+ * untouched picker never counts as a guess.
+ * @param {HTMLElement} container
+ * @param {{range: {start: number, end: number}, precision: Precision, initial?: number, onChange: (ms: number) => void}} opts
  */
-export function createDatePicker(container, { range, initial, onChange }) {
-  const days = Math.max(1, Math.round((range.end - range.start) / DAY));
-  let day = null;
+export function createDatePicker(container, { range, precision, initial, onChange }) {
+  const unit = unitOf(precision);
+  const first = periodIndex(range.start, unit);
+  const count = Math.max(1, periodIndex(range.end - 1, unit) - first + 1);
+  let index = null; // offset from `first`, null until touched
   let slot = 48; // 12:00
   let locked = false;
 
   const display = h('output', { class: 'dp-display' });
-  const daySlider = h('input', { type: 'range', min: 0, max: days - 1, step: 1, value: Math.floor(days / 2), class: 'dp-day', 'aria-label': 'Date' });
-  const dateInput = h('input', {
-    type: 'date', class: 'dp-date', 'aria-label': 'Exact date',
-    min: toTakenAt(range.start).slice(0, 10), max: toTakenAt(range.start + (days - 1) * DAY).slice(0, 10),
-  });
+  const slider = h('input', { type: 'range', min: 0, max: count - 1, step: 1, value: Math.floor(count / 2), class: 'dp-day', 'aria-label': 'Date' });
+  const exact = precision === 'year'
+    ? h('input', { type: 'number', class: 'dp-date', 'aria-label': 'Year', min: first, max: first + count - 1 })
+    : h('input', {
+      type: precision === 'month' ? 'month' : 'date', class: 'dp-date', 'aria-label': 'Exact date',
+      min: toInput(periodStart(first, unit)), max: toInput(periodStart(first + count - 1, unit)),
+    });
   const timeSlider = h('input', { type: 'range', min: 0, max: 95, step: 1, value: slot, class: 'dp-time', 'aria-label': 'Time of day' });
   const timeLabel = h('output', { class: 'dp-clock' });
 
-  const shift = (unit, n) => () => {
-    const d = new Date(range.start + (day ?? Number(daySlider.value)) * DAY);
-    if (unit === 'year') d.setUTCFullYear(d.getUTCFullYear() + n);
-    else if (unit === 'month') d.setUTCMonth(d.getUTCMonth() + n);
+  function toInput(ms) {
+    if (precision === 'year') return String(new Date(ms).getUTCFullYear());
+    return toTakenAt(ms).slice(0, precision === 'month' ? 7 : 10);
+  }
+  function fromInput(value) {
+    if (precision === 'year') return Date.UTC(Number(value), 0, 1);
+    return Date.parse(precision === 'month' ? `${value}-01T00:00:00Z` : `${value}T00:00:00Z`);
+  }
+
+  const shift = (stepUnit, n) => () => {
+    const d = new Date(periodStart(first + (index ?? Number(slider.value)), unit));
+    if (stepUnit === 'year') d.setUTCFullYear(d.getUTCFullYear() + n);
+    else if (stepUnit === 'month') d.setUTCMonth(d.getUTCMonth() + n);
     else d.setUTCDate(d.getUTCDate() + n);
-    setDay(Math.round((d.getTime() - range.start) / DAY));
+    setIndex(periodIndex(d.getTime(), unit) - first);
     emit();
   };
-  const stepper = (label, unit, n) =>
-    h('button', { type: 'button', class: 'btn subtle dp-step', onClick: shift(unit, n), 'aria-label': `${n > 0 ? 'Forward' : 'Back'} one ${unit}` }, label);
+  const stepButtons = (sign) => STEPPERS[precision].map(([u, n]) => h('button', {
+    type: 'button', class: 'btn subtle dp-step', onClick: shift(u, sign * n), 'aria-label': `${sign > 0 ? 'Forward' : 'Back'} ${n} ${u}${n > 1 ? 's' : ''}`,
+  }, `${sign > 0 ? '+' : '−'}${n} ${u}${n > 1 ? 's' : ''}`));
 
-  container.append(h('div', { class: 'datepicker' },
+  const root = h('div', { class: 'datepicker' },
     display,
-    h('div', { class: 'dp-track' }, daySlider, axis(range.start, range.end, 6)),
-    h('div', { class: 'dp-fine' },
-      stepper('−1 year', 'year', -1), stepper('−1 month', 'month', -1), stepper('−1 day', 'day', -1),
-      dateInput,
-      stepper('+1 day', 'day', 1), stepper('+1 month', 'month', 1), stepper('+1 year', 'year', 1)),
-    h('div', { class: 'dp-timerow' },
+    h('div', { class: 'dp-track' }, slider, axis(range.start, range.end, 6)),
+    // outermost steps on the outside: −1 year −1 month [date] +1 month +1 year
+    h('div', { class: 'dp-fine' }, exact, ...stepButtons(-1), ...stepButtons(1).reverse()),
+    precision === 'minute' ? h('div', { class: 'dp-timerow' },
       h('span', { class: 'dp-timelabel' }, 'Time of day'), timeLabel,
       h('div', { class: 'dp-track' }, timeSlider,
         h('div', { class: 'tl-axis', 'aria-hidden': 'true' },
-          ['00:00', '06:00', '12:00', '18:00', '24:00'].map((l, i) => h('span', { style: { left: `${i * 25}%` } }, l))))),
-  ));
+          ['00:00', '06:00', '12:00', '18:00', '24:00'].map((l, i) => h('span', { style: { left: `${i * 25}%` } }, l))))) : null,
+  );
+  container.append(root);
 
-  function setDay(value) {
-    day = Math.min(days - 1, Math.max(0, value));
-    daySlider.value = day;
-    dateInput.value = toTakenAt(range.start + day * DAY).slice(0, 10);
+  function setIndex(value) {
+    index = Math.min(count - 1, Math.max(0, value));
+    slider.value = String(index);
+    exact.value = toInput(periodStart(first + index, unit));
   }
-  const value = () => (day === null ? null : range.start + day * DAY + slot * SLOT);
+  const value = () => {
+    if (index === null) return null;
+    const startMs = periodStart(first + index, unit);
+    return precision === 'minute' ? startMs + slot * SLOT : startMs;
+  };
 
   function render() {
     const v = value();
     timeLabel.textContent = formatClock(slot * SLOT);
-    display.textContent = v === null ? 'Drag the slider to pick a date' : formatDay(v);
+    display.textContent = v === null ? 'Drag the slider to pick a date' : formatAt(periodStart(first + index, unit), unit === 'day' ? 'day' : unit);
     display.classList.toggle('empty', v === null);
-    container.querySelector('.datepicker').classList.toggle('untouched', v === null);
+    root.classList.toggle('untouched', v === null);
   }
   function emit() {
     render();
-    if (!locked && day !== null) onChange(value());
+    const v = value();
+    if (!locked && v !== null) onChange(v);
   }
 
-  daySlider.addEventListener('input', () => { setDay(Number(daySlider.value)); emit(); });
-  dateInput.addEventListener('change', () => {
-    const t = Date.parse(`${dateInput.value}T00:00:00Z`);
-    if (Number.isFinite(t)) setDay(Math.round((t - range.start) / DAY));
+  slider.addEventListener('input', () => { setIndex(Number(slider.value)); emit(); });
+  exact.addEventListener('change', () => {
+    const t = fromInput(exact.value);
+    if (Number.isFinite(t)) setIndex(periodIndex(t, unit) - first);
     emit();
   });
   timeSlider.addEventListener('input', () => {
     slot = Number(timeSlider.value);
-    if (day === null) setDay(Number(daySlider.value));
+    if (index === null) setIndex(Number(slider.value));
     emit();
   });
 
   if (Number.isFinite(initial)) {
-    setDay(Math.floor((initial - range.start) / DAY));
-    slot = Math.round(((initial - range.start) % DAY) / SLOT);
-    timeSlider.value = slot;
+    setIndex(periodIndex(initial, unit) - first);
+    if (precision === 'minute') {
+      slot = Math.round((initial - periodStart(periodIndex(initial, 'day'), 'day')) / SLOT);
+      timeSlider.value = String(slot);
+    }
   }
   render();
 
   return {
     setLocked(value) {
       locked = value;
-      for (const el of container.querySelectorAll('input, button')) el.disabled = value;
+      for (const el of root.querySelectorAll('input, button')) /** @type {HTMLInputElement} */ (el).disabled = value;
     },
     destroy() {},
   };
 }
 
-/** Lanes per player on a shared time axis, with the true time as a red line. */
-export function renderTimeline(container, { answer, guesses, colorOf }) {
-  const times = [answer.time, ...guesses.filter((g) => g.guess).map((g) => g.guess.time)];
+// ---------- reveal ----------
+
+/**
+ * Lanes per player on a shared time axis, with the true time as a red line.
+ * @param {HTMLElement} container
+ * @param {{answer: {time: number}, guesses: import('../../shared/protocol.js').ResultEntry[],
+ *   colorOf: (id: string) => string, precision: Precision, formatOff: (d: number | null) => string}} opts
+ */
+export function renderTimeline(container, { answer, guesses, colorOf, precision, formatOff }) {
+  const playing = guesses.filter((g) => !g.sitOut);
+  const timeOf = (g) => /** @type {import('../../shared/protocol.js').DateGuess} */ (g.guess).time;
+  const times = [answer.time, ...playing.filter((g) => g.guess).map(timeOf)];
   let lo = Math.min(...times);
   let hi = Math.max(...times);
-  if (hi - lo < 2 * HOUR) { lo -= HOUR; hi += HOUR; }
+  const minSpan = precision === 'minute' ? 2 * HOUR : 2 * PERIOD_HOURS[precision] * HOUR;
+  if (hi - lo < minSpan) { lo -= minSpan / 2; hi += minSpan / 2; }
   const pad = (hi - lo) * 0.06;
   lo -= pad;
   hi += pad;
@@ -186,19 +261,19 @@ export function renderTimeline(container, { answer, guesses, colorOf }) {
   const ax = pct(answer.time);
 
   container.append(h('div', { class: 'timeline' },
-    h('div', { class: 'tl-answer-label', style: { left: acrossLanes } }, formatTakenAt(answer.time)),
+    h('div', { class: 'tl-answer-label', style: { left: acrossLanes } }, formatAt(answer.time, precision)),
     h('div', { class: 'tl-lanes' },
       h('div', { class: 'tl-answer', style: { left: acrossLanes } }),
-      guesses.map((g) => h('div', { class: 'tl-lane' },
+      playing.map((g) => h('div', { class: 'tl-lane' },
         h('span', { class: 'tl-name' }, g.name),
         h('div', { class: 'tl-track' },
           g.guess ? [
             h('span', { class: 'tl-span', style: {
-              left: `min(${pct(g.guess.time)}, ${ax})`, right: `calc(100% - max(${pct(g.guess.time)}, ${ax}))`,
+              left: `min(${pct(timeOf(g))}, ${ax})`, right: `calc(100% - max(${pct(timeOf(g))}, ${ax}))`,
               borderColor: colorOf(g.playerId),
             } }),
-            h('span', { class: 'tl-dot', style: { left: pct(g.guess.time), background: colorOf(g.playerId) },
-              title: `${g.name}: ${formatTakenAt(g.guess.time)}` }),
+            h('span', { class: 'tl-dot', style: { left: pct(timeOf(g)), background: colorOf(g.playerId) },
+              title: `${g.name}: ${formatAt(timeOf(g), precision)} (${formatOff(g.distance)})` }),
           ] : h('span', { class: 'muted tl-none' }, 'No guess'))))),
     h('div', { class: 'tl-axis-row' }, h('span'), axis(lo, hi, 6)),
   ));

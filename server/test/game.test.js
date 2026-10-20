@@ -1,182 +1,257 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Game, GameError, PHASES, DISCONNECT_GRACE_MS } from '../src/game.js';
+import { Game, PHASES, DISCONNECT_GRACE_MS } from '../src/game.js';
+import { cleanSettings } from '../src/socket.js';
 
-const images = [
+const IMAGES = [
   { id: 'a', file: 'a.jpg', lat: 52.37, lng: 4.9, takenAt: '2019-04-27T14:00', caption: 'Amsterdam' },
   { id: 'b', file: 'b.jpg', lat: 48.86, lng: 2.35, takenAt: '2023-07-14T21:30', caption: 'Paris' },
-  { id: 'c', file: 'c.jpg', lat: null, lng: null, takenAt: null, caption: 'Unplaced' },
+  { id: 'c', file: 'c.jpg', lat: 50.85, lng: 4.35, takenAt: '2021-01-02T09:00', caption: 'Brussels' },
+  { id: 'd', file: 'd.jpg', lat: 51.51, lng: -0.13, takenAt: '2016-08-01T12:00', caption: 'London' },
+  { id: 'x', file: 'x.jpg', lat: null, lng: null, takenAt: null, caption: 'Nothing known' },
 ];
 
-function makeGame(opts = {}) {
-  let changes = 0;
-  const game = new Game({
+function makeGame({ images = IMAGES, set = { id: 's', name: 'Trip', map: null }, now, ...settings } = {}) {
+  return new Game({
     code: 'ABCD',
-    set: { id: 'set1', name: 'Trip' },
-    images,
-    rounds: 2,
-    roundSeconds: 30,
-    onChange: () => changes++,
-    ...opts,
+    settings: cleanSettings({ rounds: 2, roundSeconds: 30, ...settings }),
+    loadPool: () => ({ set, images }),
+    ...(now ? { now } : {}),
   });
-  return { game, changes: () => changes };
 }
 
-test('full game: early end when all guess, timer expiry, cumulative totals', (t) => {
+const entryOf = (game, round, playerId) => game.results[round].entries.find((e) => e.playerId === playerId);
+const at = (image) => ({ lat: image.lat, lng: image.lng });
+
+test('points scoring: early end, timer expiry, cumulative totals', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { game } = makeGame();
+  const game = makeGame({ scoring: 'points' });
   const host = game.addPlayer('Host');
   const guest = game.addPlayer('Guest');
 
-  assert.throws(() => game.start(guest.id), GameError);
+  assert.throws(() => game.start(guest.id), /Only the host/);
   game.start(host.id);
   assert.equal(game.phase, PHASES.ROUND);
+  assert.equal(game.snapshot(guest.id).reveal, null, 'answer hidden during the round');
 
-  // Answer is hidden during the round.
-  const snap = game.snapshot(guest.id);
-  assert.equal(snap.reveal, null);
-  assert.ok(!JSON.stringify(snap).includes(game.images[0].caption));
-
-  const first = game.images[0];
-  game.submitGuess(host.id, { lat: first.lat, lng: first.lng });
-  assert.equal(game.phase, PHASES.ROUND);
+  const [first] = game.rounds[0].images;
+  game.submitGuess(host.id, at(first));
   assert.throws(() => game.submitGuess(host.id, { lat: 0, lng: 0 }), /already guessed/);
-  game.submitGuess(guest.id, { lat: first.lat + 1, lng: first.lng });
+  game.submitGuess(guest.id, { lat: first.lat + 0.5, lng: first.lng });
   assert.equal(game.phase, PHASES.REVEAL, 'round ends once everyone guessed');
-
-  const reveal = game.snapshot(host.id).reveal;
-  assert.equal(reveal.guesses[0].name, 'Host');
-  assert.equal(reveal.guesses[0].score, 5000);
-  const guestRound1 = reveal.guesses[1].score;
-  assert.ok(guestRound1 > 0 && guestRound1 < 5000);
+  const g1 = entryOf(game, 0, guest.id).points;
+  assert.equal(entryOf(game, 0, host.id).points, 5000);
+  assert.ok(g1 > 0 && g1 < 5000);
 
   game.next(host.id);
-  assert.equal(game.roundIndex, 1);
-  game.submitGuess(guest.id, { lat: game.images[1].lat, lng: game.images[1].lng });
+  game.submitGuess(guest.id, at(game.rounds[1].images[0]));
   t.mock.timers.tick(30_000);
   assert.equal(game.phase, PHASES.REVEAL, 'round ends at the deadline');
-
   game.next(host.id);
   assert.equal(game.phase, PHASES.FINISHED);
-  const final = game.snapshot(host.id);
-  assert.equal(final.history.length, 2);
   assert.equal(game.players.get(host.id).total, 5000);
-  assert.equal(game.players.get(guest.id).total, guestRound1 + 5000);
-  assert.equal(final.players[0].name, 'Guest');
+  assert.equal(game.players.get(guest.id).total, g1 + 5000);
+  assert.equal(game.snapshot(host.id).history.length, 2);
 });
 
-test('disconnected players do not hold up a round', (t) => {
+test('placement scoring caps the cost of one big miss', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { game } = makeGame();
+  const game = makeGame({ scoring: 'placement', rounds: 2 });
+  const [a, b, c] = ['A', 'B', 'C'].map((n) => game.addPlayer(n));
+  game.start(a.id);
+  const [img] = game.rounds[0].images;
+  game.submitGuess(a.id, at(img));
+  game.submitGuess(b.id, at(img)); // tie with A
+  game.submitGuess(c.id, { lat: -img.lat, lng: img.lng + 179 }); // other side of the world
+  assert.deepEqual([a, b, c].map((p) => entryOf(game, 0, p.id).score), [1.5, 1.5, 0]);
+  assert.deepEqual([a, b, c].map((p) => entryOf(game, 0, p.id).rank), [1, 1, 3]);
+
+  game.next(a.id);
+  const [img2] = game.rounds[1].images;
+  game.submitGuess(c.id, at(img2));
+  game.submitGuess(a.id, { lat: img2.lat + 1, lng: img2.lng });
+  // B makes no guess and beats nobody
+  t.mock.timers.tick(30_000);
+  assert.deepEqual([a, b, c].map((p) => entryOf(game, 1, p.id).score), [1, 0, 2]);
+  game.next(a.id);
+  const standings = game.snapshot(a.id).players.map((p) => [p.name, p.total]);
+  assert.deepEqual(standings, [['A', 2.5], ['C', 2], ['B', 1.5]]);
+});
+
+test('disconnected players hold a round only for the grace period', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const game = makeGame();
   const host = game.addPlayer('Host');
   const guest = game.addPlayer('Guest');
   game.start(host.id);
-  game.setConnected(guest.id, false);
-  game.setConnected(guest.id, true);
   game.setConnected(guest.id, false);
   game.submitGuess(host.id, { lat: 0, lng: 0 });
   assert.equal(game.phase, PHASES.ROUND, 'a reload does not end the round straight away');
-  t.mock.timers.tick(DISCONNECT_GRACE_MS);
-  assert.equal(game.phase, PHASES.REVEAL);
-  assert.equal(game.results[0].guesses.find((g) => g.playerId === guest.id).score, 0);
-});
-
-test('joining rules', () => {
-  const { game } = makeGame();
-  const host = game.addPlayer('Host');
-  assert.throws(() => game.addPlayer('host'), /already called/);
-  assert.throws(() => game.addPlayer('  '), /Enter a name/);
-  game.start(host.id);
-  assert.throws(() => game.addPlayer('Late'), /already started/);
-  game.dispose();
-});
-
-test('rounds are capped by available pictures and images only served once started', () => {
-  const { game } = makeGame({ rounds: 10 });
-  assert.equal(game.images.length, 2);
-  assert.equal(game.imageForRound(0), null);
-  game.start(game.addPlayer('Host').id);
-  assert.ok(game.imageForRound(0));
-  assert.equal(game.imageForRound(1), null);
-  game.dispose();
-});
-
-test('an unlocked pin counts when the round ends, a locked guess wins over a later draft', (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { game } = makeGame();
-  const host = game.addPlayer('Host');
-  const guest = game.addPlayer('Guest');
-  const idle = game.addPlayer('Idle');
-  game.start(host.id);
-  const answer = game.images[0];
-
-  game.setDraft(guest.id, { lat: 0, lng: 0 });
-  game.setDraft(guest.id, { lat: answer.lat, lng: answer.lng });
-  assert.equal(game.snapshot(guest.id).round.myDraft.lat, answer.lat, 'draft survives a reload');
-  assert.equal(game.snapshot(guest.id).players.find((p) => p.id === guest.id).guessed, false);
-
-  game.submitGuess(host.id, { lat: answer.lat, lng: answer.lng });
-  assert.throws(() => game.setDraft(host.id, { lat: 0, lng: 0 }), /already guessed/);
-  t.mock.timers.tick(30_000);
-
-  const byId = Object.fromEntries(game.results[0].guesses.map((g) => [g.playerId, g]));
-  assert.deepEqual([byId[host.id].locked, byId[host.id].score], [true, 5000]);
-  assert.deepEqual([byId[guest.id].locked, byId[guest.id].score], [false, 5000]);
-  assert.deepEqual([byId[idle.id].guess, byId[idle.id].score], [null, 0]);
-});
-
-test('date mode: hidden padded range, scoring in hours, answers revealed only afterwards', (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const now = Date.parse('2024-01-01T12:00:00Z');
-  const { game } = makeGame({ mode: 'date', now: () => now });
-  const host = game.addPlayer('Host');
-  const guest = game.addPlayer('Guest');
-  const first = Date.parse('2019-04-27T14:00:00Z');
-  const last = Date.parse('2023-07-14T21:30:00Z');
-
-  assert.equal(game.images.length, 2, 'pictures without a date are skipped');
-  assert.ok(Math.abs(game.scale - (last - first) / 3_600_000) < 1e-6);
-  const { start, end } = game.setup.range;
-  assert.ok(start < first && end > last, 'range covers every picture');
-  assert.ok(end <= Date.parse('2024-01-02T00:00:00Z'), 'range stops at today');
-  assert.equal(start % 86_400_000, 0, 'range starts at midnight');
-
-  game.start(host.id);
-  const snap = game.snapshot(guest.id);
-  assert.deepEqual(snap.setup.range, { start, end });
-  assert.ok(!JSON.stringify(snap).includes('takenAt'));
-
-  const answer = Date.parse(`${game.images[0].takenAt}:00Z`);
-  assert.throws(() => game.submitGuess(host.id, { time: start - 1 }), /within the timeline/);
-  assert.throws(() => game.submitGuess(host.id, { time: 'soon' }), /within the timeline/);
-  game.submitGuess(host.id, { time: answer + 10 * 60_000 });
-  game.setDraft(guest.id, { time: answer + 48 * 3_600_000 });
-  t.mock.timers.tick(30_000);
-
-  const reveal = game.snapshot(host.id).reveal;
-  assert.equal(reveal.answer.time, answer);
-  const [best, second] = reveal.guesses;
-  assert.deepEqual([best.name, best.score], ['Host', 5000], 'within 15 minutes is perfect');
-  assert.equal(second.distance, 48);
-  assert.equal(second.score, Math.round(5000 * Math.exp((-10 * 48) / game.scale)));
-});
-
-test('a set with no dated pictures cannot start a date game', () => {
-  assert.throws(() => makeGame({ mode: 'date', images: [images[2]] }), /no pictures with a date/);
-});
-
-test('a player who reloads within the grace period keeps the round open', (t) => {
-  t.mock.timers.enable({ apis: ['setTimeout'] });
-  const { game } = makeGame();
-  const host = game.addPlayer('Host');
-  const guest = game.addPlayer('Guest');
-  game.start(host.id);
-  game.submitGuess(host.id, { lat: 0, lng: 0 });
-  game.setConnected(guest.id, false);
   t.mock.timers.tick(DISCONNECT_GRACE_MS / 2);
   game.setConnected(guest.id, true);
   t.mock.timers.tick(DISCONNECT_GRACE_MS);
-  assert.equal(game.phase, PHASES.ROUND);
-  game.submitGuess(guest.id, { lat: 1, lng: 1 });
+  assert.equal(game.phase, PHASES.ROUND, 'reconnected in time');
+  game.setConnected(guest.id, false);
+  t.mock.timers.tick(DISCONNECT_GRACE_MS);
   assert.equal(game.phase, PHASES.REVEAL);
+  assert.equal(entryOf(game, 0, guest.id).points, 0);
+});
+
+test('an unlocked pick counts when the round ends', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const game = makeGame({ scoring: 'points' });
+  const host = game.addPlayer('Host');
+  const guest = game.addPlayer('Guest');
+  game.start(host.id);
+  const [img] = game.rounds[0].images;
+  game.setDraft(guest.id, { lat: 0, lng: 0 });
+  game.setDraft(guest.id, at(img));
+  assert.deepEqual(game.snapshot(guest.id).round.myDraft, at(img), 'draft survives a reload');
+  game.submitGuess(host.id, at(img));
+  t.mock.timers.tick(30_000);
+  assert.deepEqual([entryOf(game, 0, guest.id).locked, entryOf(game, 0, guest.id).points], [false, 5000]);
+});
+
+test('date mode: padded hidden range and precision-aware distances', () => {
+  const now = () => Date.parse('2024-01-01T12:00:00Z');
+  const minute = makeGame({ mode: 'date', now });
+  const host = minute.addPlayer('Host');
+  minute.start(host.id);
+  const { start, end } = minute.setup.range;
+  assert.ok(start < Date.parse('2016-08-01T12:00Z') && end > Date.parse('2023-07-14T21:30Z'), 'covers every picture');
+  assert.ok(end <= Date.parse('2024-01-02T00:00Z'), 'stops at today');
+  assert.ok(!JSON.stringify(minute.snapshot(host.id)).includes('takenAt'));
+  assert.throws(() => minute.submitGuess(host.id, { time: start - 1 }), /within the timeline/);
+  minute.dispose();
+
+  const year = makeGame({ mode: 'date', precision: 'year', now });
+  const p = year.addPlayer('P');
+  year.start(p.id);
+  assert.equal(new Date(year.setup.range.start).getUTCMonth(), 0, 'year timeline starts on 1 January');
+  const answer = Date.parse(`${year.rounds[0].images[0].takenAt}:00Z`);
+  const sameYear = Date.UTC(new Date(answer).getUTCFullYear(), 11, 31, 23);
+  year.submitGuess(p.id, { time: sameYear });
+  const e = entryOf(year, 0, p.id);
+  assert.deepEqual([e.distance, e.points], [0, 5000], 'any day in the right year is perfect');
+  assert.equal(e.guess.time, Date.UTC(new Date(answer).getUTCFullYear(), 0, 1), 'guess snapped to the year');
+  year.dispose();
+});
+
+test('order mode: wrong pairs, scores and validation', () => {
+  const game = makeGame({ mode: 'order', orderSize: 4, rounds: 5, scoring: 'points' });
+  const a = game.addPlayer('A');
+  const b = game.addPlayer('B');
+  game.start(a.id);
+  assert.equal(game.rounds.length, 1, 'four dated pictures make one round of four');
+  const images = game.rounds[0].images;
+  const correct = images.map((_, i) => i).sort((x, y) => images[x].takenAt.localeCompare(images[y].takenAt));
+  assert.throws(() => game.submitGuess(a.id, { order: [0, 0, 1, 2] }), /every picture/);
+  game.submitGuess(a.id, { order: correct });
+  game.submitGuess(b.id, { order: [...correct].reverse() });
+  assert.deepEqual([entryOf(game, 0, a.id).distance, entryOf(game, 0, a.id).points], [0, 5000]);
+  assert.deepEqual([entryOf(game, 0, b.id).distance, entryOf(game, 0, b.id).points], [6, 0]);
+  assert.deepEqual(game.snapshot(a.id).reveal.answer.order, correct);
+});
+
+test('players-bring-photos: owners sit out and get the average', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const images = [];
+  const game = makeGame({ source: 'players', scoring: 'points', rounds: 1, images });
+  const host = game.addPlayer('Host');
+  const a = game.addPlayer('A');
+  const b = game.addPlayer('B');
+  images.push({ ...IMAGES[0], contributorId: host.id });
+  game.start(host.id);
+  assert.deepEqual(game.rounds[0].sitOut, [host.id]);
+  assert.equal(game.snapshot(host.id).round.sittingOut, true);
+  assert.throws(() => game.submitGuess(host.id, { lat: 0, lng: 0 }), /your picture/);
+  game.submitGuess(a.id, at(IMAGES[0]));
+  game.submitGuess(b.id, { lat: 0, lng: 0 });
+  assert.equal(game.phase, PHASES.REVEAL, 'the owner is not waited for');
+  const own = entryOf(game, 0, host.id);
+  assert.deepEqual([own.sitOut, own.points], [true, Math.round((5000 + entryOf(game, 0, b.id).points) / 2)]);
+  assert.equal(game.snapshot(host.id).reveal.guesses.at(-1).playerId, host.id, 'listed last');
+});
+
+test('a round with only the owner connected ends right away', () => {
+  const images = [{ ...IMAGES[0] }];
+  const game = makeGame({ source: 'players', rounds: 1, images });
+  const host = game.addPlayer('Host');
+  images[0].contributorId = host.id;
+  game.start(host.id);
+  assert.equal(game.phase, PHASES.REVEAL);
+});
+
+test('presenter hosts without playing', () => {
+  const game = makeGame({ presenter: true });
+  const presenter = game.addPresenter('Screen');
+  assert.throws(() => game.start(presenter.id), /at least one player/);
+  const p = game.addPlayer('Player');
+  assert.equal(game.hostId, presenter.id);
+  game.start(presenter.id);
+  assert.throws(() => game.submitGuess(presenter.id, { lat: 0, lng: 0 }), /Only players/);
+  const snap = game.snapshot(presenter.id);
+  assert.deepEqual(snap.players.map((x) => x.id), [p.id]);
+  assert.equal(snap.presenter.name, 'Screen');
+  game.dispose();
+});
+
+test('rematch resets scores and prefers unplayed pictures', () => {
+  const game = makeGame({ rounds: 2 });
+  const host = game.addPlayer('Host');
+  game.start(host.id);
+  const firstIds = game.rounds.map((r) => r.images[0].id);
+  for (let i = 0; i < 2; i++) {
+    game.submitGuess(host.id, at(game.rounds[i].images[0]));
+    game.next(host.id);
+  }
+  assert.equal(game.phase, PHASES.FINISHED);
+  game.restart(host.id);
+  assert.equal(game.phase, PHASES.LOBBY);
+  assert.equal(game.players.get(host.id).total, 0);
+  game.start(host.id);
+  const secondIds = game.rounds.map((r) => r.images[0].id);
+  assert.equal(secondIds.filter((id) => firstIds.includes(id)).length, 0);
+  game.dispose();
+});
+
+test('a saved game resumes with its round and deadline', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let clock = 1_000_000;
+  const now = () => clock;
+  const game = makeGame({ now, scoring: 'points' });
+  const host = game.addPlayer('Host');
+  const guest = game.addPlayer('Guest');
+  game.start(host.id);
+  game.submitGuess(host.id, at(game.rounds[0].images[0]));
+  const saved = JSON.parse(JSON.stringify(game.toJSON()));
+  game.dispose();
+
+  clock += 10_000;
+  const restored = Game.fromJSON(saved, { loadPool: () => ({ set: { id: 's', name: 'Trip' }, images: IMAGES }), now });
+  assert.equal(restored.phase, PHASES.ROUND);
+  assert.equal(restored.players.get(guest.id).connected, false);
+  assert.ok(restored.guesses.has(host.id));
+  t.mock.timers.tick(20_000);
+  assert.equal(restored.phase, PHASES.REVEAL, 'the remaining 20 s of the round still run');
+  assert.equal(restored.players.get(host.id).total, 5000);
+});
+
+test('custom map: pixel distances as percent of the map width', () => {
+  const set = { id: 's', name: 'Office', map: { file: 'map.jpg', width: 1000, height: 500, metersWide: null } };
+  const images = [{ id: 'p', file: 'p.jpg', lat: 100, lng: 100, takenAt: null, caption: '' }];
+  const game = makeGame({ set, images, rounds: 1, scoring: 'points' });
+  const host = game.addPlayer('Host');
+  game.start(host.id);
+  assert.equal(game.setup.map.width, 1000);
+  assert.throws(() => game.submitGuess(host.id, { lat: 600, lng: 10 }), /on the map/);
+  game.submitGuess(host.id, { lat: 100, lng: 200 });
+  assert.equal(entryOf(game, 0, host.id).distance, 10, '100 px of 1000 px is 10%');
+});
+
+test('not enough pictures for the mode gives a clear error', () => {
+  const game = makeGame({ mode: 'order', orderSize: 6 });
+  const host = game.addPlayer('Host');
+  assert.throws(() => game.start(host.id), /4 pictures with a date; this game needs at least 6/);
+  assert.throws(() => makeGame({ mode: 'date', images: [IMAGES[4]] }).prepare(), /no pictures with a date/);
 });

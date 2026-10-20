@@ -1,0 +1,14 @@
+{
+  "name": "pinpoint",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "npm --prefix server test",
+    "check": "tsc -p server && tsc -p web",
+    "e2e": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.1",
+    "typescript": "^7.0.2"
+  }
+}
