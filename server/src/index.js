@@ -5,6 +5,7 @@ import { Server } from 'socket.io';
 import { SetStore, isImageType } from './sets.js';
 import { setupSockets } from './socket.js';
 import { lanAddresses } from './network.js';
+import { isDated, isLocated, parseTakenAt } from './modes.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = process.env.DATA_DIR || './data';
@@ -44,7 +45,8 @@ app.get('/api/sets', (req, res) => {
     name,
     createdAt,
     imageCount: images.length,
-    locatedCount: images.filter((i) => i.lat !== null && i.lng !== null).length,
+    locatedCount: images.filter(isLocated).length,
+    datedCount: images.filter(isDated).length,
     cover: images[0] ? `/api/sets/${id}/files/${images[0].file}` : null,
   })));
 });
@@ -75,11 +77,13 @@ app.post('/api/sets/:id/images', upload.single('image'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Upload a JPEG, PNG, WebP, GIF or AVIF image.' });
   const lat = parseCoord(req.body.lat, 90);
   const lng = parseCoord(req.body.lng, 180);
+  const takenAt = parseTakenAt(req.body.takenAt) === null ? null : req.body.takenAt;
   const image = store.addImage(req.params.id, {
     buffer: req.file.buffer,
     mimetype: req.file.mimetype,
     lat: lat ?? null,
     lng: lng ?? null,
+    takenAt,
     caption: String(req.body.caption ?? '').slice(0, 200),
   });
   return image ? res.status(201).json(image) : notFound(res);
@@ -93,6 +97,12 @@ app.patch('/api/sets/:id/images/:imageId', (req, res) => {
     if (patch.lat === undefined || patch.lng === undefined) {
       return res.status(400).json({ error: 'Latitude and longitude are out of range.' });
     }
+  }
+  if ('takenAt' in req.body) {
+    if (req.body.takenAt !== null && parseTakenAt(req.body.takenAt) === null) {
+      return res.status(400).json({ error: 'Use a date and time like 2024-07-14T15:30.' });
+    }
+    patch.takenAt = req.body.takenAt;
   }
   if ('caption' in req.body) patch.caption = String(req.body.caption ?? '').slice(0, 200);
   const image = store.updateImage(req.params.id, req.params.imageId, patch);

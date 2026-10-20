@@ -1,10 +1,13 @@
 import crypto from 'node:crypto';
-import { haversineKm, scaleForLocations, score } from './scoring.js';
+import { GameError } from './errors.js';
+import { MODES } from './modes.js';
 
 export const MAX_PLAYERS = 30;
+// A page reload briefly disconnects a player; don't end the round on them in the meantime.
+export const DISCONNECT_GRACE_MS = 8000;
 export const PHASES = { LOBBY: 'lobby', ROUND: 'round', REVEAL: 'reveal', FINISHED: 'finished' };
 
-export class GameError extends Error {}
+export { GameError };
 
 function shuffle(items) {
   const a = [...items];
@@ -20,20 +23,29 @@ export class Game {
    * @param {object} opts
    * @param {string} opts.code
    * @param {{id: string, name: string}} opts.set
-   * @param {Array<{id, lat, lng, caption}>} opts.images located images to draw rounds from
+   * @param {'location' | 'date'} [opts.mode] what players guess
+   * @param {Array<{id, lat, lng, takenAt, caption}>} opts.images the set's pictures; rounds use those ready for the mode
    * @param {number} opts.rounds
    * @param {number} opts.roundSeconds
-   * @param {number} [opts.scaleKm] overrides the field size derived from the images
+   * @param {number} [opts.scale] overrides the field size (km for location, hours for date)
    * @param {() => void} opts.onChange called whenever clients should get a fresh snapshot
    */
-  constructor({ code, set, images, rounds, roundSeconds, scaleKm, onChange, now = Date.now }) {
-    if (images.length === 0) throw new GameError('This picture set has no pictures with a location yet.');
+  constructor({ code, set, mode = 'location', images, rounds, roundSeconds, scale, onChange, now = Date.now }) {
+    this.objective = MODES[mode];
+    if (!this.objective) throw new GameError('Unknown game mode.');
+    const ready = images.filter(this.objective.isReady);
+    if (ready.length === 0) {
+      throw new GameError(`This picture set has no pictures with a ${mode === 'date' ? 'date' : 'location'} yet.`);
+    }
     this.code = code;
+    this.mode = mode;
     this.setId = set.id;
     this.setName = set.name;
     this.roundSeconds = roundSeconds;
-    this.scaleKm = scaleKm || scaleForLocations(images);
-    this.images = shuffle(images).slice(0, Math.max(1, Math.min(rounds, images.length)));
+    this.scale = scale || this.objective.defaultScale(ready);
+    // Derived from every ready picture, not just the drawn rounds, so it says less about them.
+    this.setup = this.objective.setup(ready, now());
+    this.images = shuffle(ready).slice(0, Math.max(1, Math.min(rounds, ready.length)));
     this.onChange = onChange;
     this.now = now;
 
@@ -46,6 +58,7 @@ export class Game {
     this.drafts = new Map();
     this.results = [];
     this.timer = null;
+    this.graceTimers = new Map();
     this.lastActivity = now();
   }
 
@@ -68,14 +81,23 @@ export class Game {
     const player = this.players.get(playerId);
     if (!player) return;
     player.connected = connected;
+    clearTimeout(this.graceTimers.get(playerId));
+    this.graceTimers.delete(playerId);
+    if (!connected) {
+      this.graceTimers.set(playerId, setTimeout(() => {
+        this.graceTimers.delete(playerId);
+        this.maybeEndRound();
+      }, DISCONNECT_GRACE_MS));
+    }
     this.touch();
-    if (!connected) this.maybeEndRound();
   }
 
   kick(byId, playerId) {
     this.requireHost(byId);
     if (playerId === this.hostId) throw new GameError('The host cannot be removed.');
     this.players.delete(playerId);
+    clearTimeout(this.graceTimers.get(playerId));
+    this.graceTimers.delete(playerId);
     this.guesses.delete(playerId);
     this.drafts.delete(playerId);
     this.touch();
@@ -104,28 +126,24 @@ export class Game {
     if (this.phase === PHASES.ROUND) this.endRound();
   }
 
-  submitGuess(playerId, lat, lng) {
-    this.guesses.set(playerId, this.checkGuess(playerId, lat, lng));
+  submitGuess(playerId, payload) {
+    this.guesses.set(playerId, this.checkGuess(playerId, payload));
     this.drafts.delete(playerId);
     this.touch();
     this.maybeEndRound();
   }
 
   /** A pin placed but not locked in yet. It counts if the round ends before the player locks in. */
-  setDraft(playerId, lat, lng) {
-    this.drafts.set(playerId, this.checkGuess(playerId, lat, lng));
+  setDraft(playerId, payload) {
+    this.drafts.set(playerId, this.checkGuess(playerId, payload));
     this.lastActivity = this.now();
   }
 
-  checkGuess(playerId, lat, lng) {
+  checkGuess(playerId, payload) {
     if (this.phase !== PHASES.ROUND) throw new GameError('There is no round in progress.');
     if (!this.players.has(playerId)) throw new GameError('You are not part of this game.');
     if (this.guesses.has(playerId)) throw new GameError('You already guessed this round.');
-    if (!Number.isFinite(lat) || !Number.isFinite(lng) || Math.abs(lat) > 90) {
-      throw new GameError('That is not a valid map position.');
-    }
-    // Leaflet allows panning across the antimeridian; normalise to [-180, 180).
-    return { lat, lng: ((((lng + 180) % 360) + 360) % 360) - 180 };
+    return this.objective.parseGuess(payload ?? {}, this.setup);
   }
 
   startRound() {
@@ -141,7 +159,8 @@ export class Game {
 
   maybeEndRound() {
     if (this.phase !== PHASES.ROUND) return;
-    const active = [...this.players.values()].filter((p) => p.connected);
+    // Players who just dropped out may be reloading, so they still count for a few seconds.
+    const active = [...this.players.values()].filter((p) => p.connected || this.graceTimers.has(p.id));
     if (active.length > 0 && active.every((p) => this.guesses.has(p.id))) this.endRound();
   }
 
@@ -153,9 +172,9 @@ export class Game {
     const guesses = [...this.players.values()].map((player) => {
       const locked = this.guesses.has(player.id);
       const guess = this.guesses.get(player.id) ?? this.drafts.get(player.id);
-      if (!guess) return { playerId: player.id, guess: null, locked: false, distanceKm: null, score: 0 };
-      const distanceKm = haversineKm(guess, answer);
-      return { playerId: player.id, guess, locked, distanceKm, score: score(distanceKm, this.scaleKm) };
+      if (!guess) return { playerId: player.id, guess: null, locked: false, distance: null, score: 0 };
+      const distance = this.objective.distance(guess, answer);
+      return { playerId: player.id, guess, locked, distance, score: this.objective.score(distance, this.scale) };
     });
     for (const g of guesses) this.players.get(g.playerId).total += g.score;
     this.results.push({ answer, guesses });
@@ -175,6 +194,7 @@ export class Game {
 
   dispose() {
     clearTimeout(this.timer);
+    for (const timer of this.graceTimers.values()) clearTimeout(timer);
     this.onChange = null;
   }
 
@@ -186,7 +206,7 @@ export class Game {
   /** What one player is allowed to see. Never leaks the answer of a running round. */
   snapshot(playerId) {
     const nameOf = (id) => this.players.get(id)?.name ?? 'Left the game';
-    const publicAnswer = (a) => ({ lat: a.lat, lng: a.lng, caption: a.caption });
+    const publicAnswer = (a) => ({ ...this.objective.answer(a), caption: a.caption });
     const publicResult = (r, index) => ({
       index,
       answer: publicAnswer(r.answer),
@@ -203,7 +223,9 @@ export class Game {
       hostId: this.hostId,
       totalRounds: this.images.length,
       roundSeconds: this.roundSeconds,
-      scaleKm: this.scaleKm,
+      mode: this.mode,
+      scale: this.scale,
+      setup: this.setup,
       serverNow: this.now(),
       players: [...this.players.values()]
         .map((p) => ({

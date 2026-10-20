@@ -26,7 +26,7 @@ export function scaleForLocations(locations) {
 }
 
 // GeoGuessr-style exponential falloff: being off by a tenth of the field costs ~63%.
-export function score(distanceKm, scaleKm) {
-  if (distanceKm <= PERFECT_KM) return MAX_SCORE;
-  return Math.round(MAX_SCORE * Math.exp((-10 * distanceKm) / scaleKm));
+export function score(distance, scale, perfect = PERFECT_KM) {
+  if (distance <= perfect) return MAX_SCORE;
+  return Math.round(MAX_SCORE * Math.exp((-10 * distance) / scale));
 }

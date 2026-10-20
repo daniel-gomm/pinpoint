@@ -71,13 +71,13 @@ export class SetStore {
     return true;
   }
 
-  addImage(setId, { buffer, mimetype, lat, lng, caption }) {
+  addImage(setId, { buffer, mimetype, lat, lng, takenAt, caption }) {
     const set = this.get(setId);
     if (!set) return null;
     const id = newId();
     const file = `${id}.${EXTENSIONS[mimetype]}`;
     fs.writeFileSync(path.join(this.dir(setId), file), buffer);
-    const image = { id, file, lat: lat ?? null, lng: lng ?? null, caption: caption ?? '' };
+    const image = { id, file, lat: lat ?? null, lng: lng ?? null, takenAt: takenAt ?? null, caption: caption ?? '' };
     set.images.push(image);
     this.save(set);
     return image;
@@ -87,7 +87,7 @@ export class SetStore {
     const set = this.get(setId);
     const image = set?.images.find((i) => i.id === imageId);
     if (!image) return null;
-    for (const key of ['lat', 'lng', 'caption']) {
+    for (const key of ['lat', 'lng', 'takenAt', 'caption']) {
       if (key in patch) image[key] = patch[key];
     }
     this.save(set);
@@ -110,6 +110,3 @@ export class SetStore {
     return path.join(dir, file);
   }
 }
-
-export const isLocated = (image) =>
-  Number.isFinite(image.lat) && Number.isFinite(image.lng);

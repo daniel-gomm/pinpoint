@@ -1,6 +1,5 @@
 import crypto from 'node:crypto';
 import { Game, GameError } from './game.js';
-import { isLocated } from './sets.js';
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // no I/O to avoid confusion
 const IDLE_MS = 3 * 60 * 60 * 1000;
@@ -64,17 +63,19 @@ export function setupSockets(io, store) {
   }
 
   io.on('connection', (socket) => {
-    socket.on('game:create', handle(socket, ({ setId, rounds, roundSeconds, scaleKm, name }) => {
+    socket.on('game:create', handle(socket, ({ setId, mode, rounds, roundSeconds, scale, name }) => {
       const set = store.get(String(setId));
       if (!set) throw new GameError('That picture set does not exist.');
       const code = newCode();
       const game = new Game({
         code,
         set,
-        images: set.images.filter(isLocated),
+        mode: mode === 'date' ? 'date' : 'location',
+        images: set.images,
         rounds: clampInt(rounds, 1, 100, 5),
         roundSeconds: clampInt(roundSeconds, 10, 600, 60),
-        scaleKm: scaleKm ? clampInt(scaleKm, 1, 20000, undefined) : undefined,
+        // km for location; hours for date (up to ~200 years)
+        scale: scale ? clampInt(scale, 1, 2_000_000, undefined) : undefined,
         onChange: () => broadcast(game),
       });
       const player = game.addPlayer(name);
@@ -103,10 +104,10 @@ export function setupSockets(io, store) {
     socket.on('game:kick', handle(socket, ({ playerId }) => currentGame(socket).kick(socket.data.playerId, playerId)));
     socket.on('round:next', handle(socket, () => currentGame(socket).next(socket.data.playerId)));
     socket.on('round:end', handle(socket, () => currentGame(socket).endRoundEarly(socket.data.playerId)));
-    socket.on('guess:draft', handle(socket, ({ lat, lng }) =>
-      currentGame(socket).setDraft(socket.data.playerId, Number(lat), Number(lng))));
-    socket.on('guess:submit', handle(socket, ({ lat, lng }) =>
-      currentGame(socket).submitGuess(socket.data.playerId, Number(lat), Number(lng))));
+    socket.on('guess:draft', handle(socket, (payload) =>
+      currentGame(socket).setDraft(socket.data.playerId, payload)));
+    socket.on('guess:submit', handle(socket, (payload) =>
+      currentGame(socket).submitGuess(socket.data.playerId, payload)));
 
     socket.on('disconnect', () => detach(socket));
   });

@@ -24,7 +24,8 @@ export function setListView(root) {
       s.cover ? h('img', { src: s.cover, alt: '', loading: 'lazy' }) : h('div', { class: 'cover-empty' }),
       h('strong', {}, s.name),
       h('span', { class: 'muted' }, `${s.imageCount} pictures`,
-        s.imageCount > s.locatedCount ? `, ${s.imageCount - s.locatedCount} without a location` : ''),
+        s.imageCount > s.locatedCount ? `, ${s.imageCount - s.locatedCount} without a location` : '',
+        s.imageCount > s.datedCount ? `, ${s.imageCount - s.datedCount} without a date` : ''),
     )));
   }).catch((err) => toast(err.message, 'error'));
 
@@ -41,8 +42,16 @@ export function setListView(root) {
 
 async function prepareUpload(file) {
   let gps = null;
+  let takenAt = null;
   try {
     gps = await exifr.gps(file);
+  } catch { /* no EXIF */ }
+  try {
+    // Raw EXIF strings ("2023:07:14 15:30:12") are the camera's wall-clock time, which is what we store.
+    const exif = await exifr.parse(file, { pick: ['DateTimeOriginal', 'CreateDate'], reviveValues: false });
+    const raw = exif?.DateTimeOriginal ?? exif?.CreateDate;
+    const m = typeof raw === 'string' && raw.match(/^(\d{4}):(\d{2}):(\d{2})[ T](\d{2}):(\d{2})/);
+    if (m && m[1] !== '0000') takenAt = `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}`;
   } catch { /* no EXIF */ }
   // Re-encode to strip EXIF (players could otherwise read the GPS tag) and shrink huge photos.
   let blob = file;
@@ -62,6 +71,7 @@ async function prepareUpload(file) {
     form.append('lat', gps.latitude);
     form.append('lng', gps.longitude);
   }
+  if (takenAt) form.append('takenAt', takenAt);
   return form;
 }
 
@@ -74,7 +84,7 @@ export function setEditorView(root, setId) {
   const fileInput = h('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true, onChange: (e) => upload(e.target.files) });
   const dropzone = h('button', { class: 'dropzone', type: 'button', onClick: () => fileInput.click() },
     h('strong', {}, 'Add pictures'),
-    h('span', {}, 'Drop photos here or click to choose. Locations are read from the photo when it has GPS data.'));
+    h('span', {}, 'Drop photos here or click to choose. Place and date are read from the photo’s camera data when it has them.'));
   const thumbs = h('ul', { class: 'thumbs' });
   const status = h('p', { class: 'muted set-status' });
   const mapEl = h('div', { class: 'map editor-map' });
@@ -127,6 +137,7 @@ export function setEditorView(root, setId) {
 
   const fileUrl = (img) => `/api/sets/${set.id}/files/${img.file}`;
   const located = (img) => img.lat !== null && img.lng !== null;
+  const dated = (img) => Boolean(img.takenAt);
 
   function renderAll() {
     renderThumbs();
@@ -135,19 +146,23 @@ export function setEditorView(root, setId) {
   }
 
   function renderThumbs() {
-    const missing = set.images.filter((i) => !located(i)).length;
+    const noPlace = set.images.filter((i) => !located(i)).length;
+    const noDate = set.images.filter((i) => !dated(i)).length;
+    const gaps = [noPlace && `${noPlace} without a location`, noDate && `${noDate} without a date`].filter(Boolean);
     status.textContent = set.images.length
-      ? `${set.images.length} pictures${missing ? `, ${missing} still need a location` : ', all placed'}`
+      ? `${set.images.length} pictures${gaps.length ? `, ${gaps.join(', ')}` : ', all with location and date'}`
       : '';
     thumbs.replaceChildren(...set.images.map((img) => h('li', {},
       h('button', {
         type: 'button',
-        class: `thumb${img.id === selectedId ? ' selected' : ''}${located(img) ? '' : ' unplaced'}`,
+        class: `thumb${img.id === selectedId ? ' selected' : ''}${located(img) && dated(img) ? '' : ' unplaced'}`,
         'aria-pressed': img.id === selectedId ? 'true' : 'false',
         onClick: () => select(img.id),
       },
       h('img', { src: fileUrl(img), alt: img.caption || 'Picture', loading: 'lazy' }),
-      located(img) ? null : h('span', { class: 'badge' }, 'No location')),
+      h('span', { class: 'badges' },
+        located(img) ? null : h('span', { class: 'badge' }, 'No place'),
+        dated(img) ? null : h('span', { class: 'badge' }, 'No date'))),
     )));
   }
 
@@ -167,10 +182,23 @@ export function setEditorView(root, setId) {
         } catch (err) { toast(err.message, 'error'); }
       },
     });
+    const takenAt = h('input', {
+      type: 'datetime-local', value: img.takenAt ?? '',
+      onChange: async (e) => {
+        try {
+          const value = e.target.value ? e.target.value.slice(0, 16) : null;
+          Object.assign(img, await api(`/api/sets/${set.id}/images/${img.id}`, { method: 'PATCH', body: { takenAt: value } }));
+          renderThumbs();
+          toast(value ? 'Date saved' : 'Date removed');
+        } catch (err) { toast(err.message, 'error'); }
+      },
+    });
     detail.replaceChildren(
       h('img', { class: 'detail-img', src: fileUrl(img), alt: img.caption || 'Selected picture' }),
       h('div', { class: 'detail-fields' },
-        h('label', {}, 'Caption', caption),
+        h('div', { class: 'row' },
+          h('label', {}, 'Caption', caption),
+          h('label', {}, 'Taken on', takenAt)),
         h('p', { class: located(img) ? 'muted' : 'warn' },
           located(img)
             ? `Placed at ${img.lat.toFixed(5)}, ${img.lng.toFixed(5)}. Click the map or drag the pin to move it.`

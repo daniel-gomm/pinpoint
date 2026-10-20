@@ -1,6 +1,7 @@
 import { h, api, toast, store, formatDistance, formatPoints, playerColor } from './util.js';
 import { connect, request, rememberPlayer, rememberedPlayer, forgetPlayer } from './socket.js';
 import { createMap, pinIcon, dotIcon, nearLng, escapeHtml, L } from './map.js';
+import { createDatePicker, renderTimeline, formatDuration, formatTakenAt } from './time.js';
 
 const URGENT_SECONDS = 15;
 const isLocalhost = () => ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
@@ -27,6 +28,8 @@ export function gameView(root, codeParam) {
 
   const me = () => state.players.find((p) => p.id === state.you);
   const isHost = () => state.hostId === state.you;
+  const isDateMode = () => state.mode === 'date';
+  const formatOff = (distance) => (isDateMode() ? formatDuration(distance) : formatDistance(distance));
   const serverNow = () => Date.now() + clockOffset;
   const colorOf = (playerId) => {
     const order = [...state.players].sort((a, b) => a.id.localeCompare(b.id));
@@ -140,7 +143,8 @@ export function gameView(root, codeParam) {
         h('span', { class: 'stamp-code' }, code)),
       h('div', { class: 'lobby-info' },
         h('h1', {}, state.setName),
-        h('p', { class: 'muted' }, `${state.totalRounds} rounds, ${state.roundSeconds} seconds each.`),
+        h('p', { class: 'muted' },
+          `${isDateMode() ? 'Guess the date' : 'Guess the place'}: ${state.totalRounds} rounds, ${state.roundSeconds} seconds each.`),
         h('div', { class: 'share' },
           shareInput,
           h('button', { class: 'btn', type: 'button', onClick: async () => {
@@ -167,61 +171,62 @@ export function gameView(root, codeParam) {
     const { round } = state;
     let pending = round.myGuess ?? round.myDraft;
     let locked = Boolean(round.myGuess);
-    let marker = null;
+    let draftTimer = null;
 
     const timer = h('span', { class: 'timer' });
     const bar = h('span', { class: 'timer-bar' });
-    const lockBtn = h('button', { class: 'btn primary big', type: 'button', disabled: true, onClick: lockIn }, 'Place a pin on the map');
+    const lockBtn = h('button', { class: 'btn primary big', type: 'button', disabled: true, onClick: lockIn });
     const players = h('div', { class: 'round-players' });
     const hostTools = h('div');
-    const mapEl = h('div', { class: 'map guess-map' });
+    const inputEl = h('div', { class: isDateMode() ? 'date-pane' : 'map guess-map' });
     const photo = h('figure', { class: 'photo', onClick: () => photo.classList.toggle('zoomed'), title: 'Click to enlarge' },
-      h('img', { src: round.imageUrl, alt: 'Where was this taken?' }));
+      h('img', { src: round.imageUrl, alt: isDateMode() ? 'When was this taken?' : 'Where was this taken?' }));
 
-    const section = h('section', { class: 'round' },
+    const section = h('section', { class: `round mode-${state.mode}` },
       h('div', { class: 'round-bar' },
         h('strong', {}, `Round ${round.index + 1} of ${state.totalRounds}`),
         h('span', { class: 'timer-wrap' }, timer, h('span', { class: 'timer-track' }, bar)),
         h('button', { class: 'link', type: 'button', onClick: leave }, 'Leave')),
       h('div', { class: 'round-body' },
         photo,
-        h('div', { class: 'guess-pane' }, mapEl, lockBtn),
+        h('div', { class: 'guess-pane' }, inputEl, lockBtn),
         h('aside', { class: 'round-side' }, players, hostTools)),
     );
     root.replaceChildren(section);
 
-    const map = createMap(mapEl);
-    teardown.push(() => map.remove());
-    map.on('click', (e) => {
+    // Each pick is sent as a draft so it still counts if time runs out before locking in.
+    function pick(payload) {
       if (locked) return;
-      pending = e.latlng;
-      drawPending();
-      // The server keeps the latest pin so it still counts if time runs out before locking in.
-      request('guess:draft', { lat: pending.lat, lng: pending.lng });
-    });
+      pending = payload;
+      refresh();
+      clearTimeout(draftTimer);
+      draftTimer = setTimeout(() => request('guess:draft', payload), isDateMode() ? 300 : 0);
+    }
+    teardown.push(() => clearTimeout(draftTimer));
 
-    function drawPending() {
-      if (!pending) return;
-      if (!marker) marker = L.marker(pending, { icon: pinIcon(colorOf(state.you)), keyboard: false }).addTo(map);
-      marker.setLatLng(pending);
-      lockBtn.disabled = locked;
-      lockBtn.textContent = locked ? 'Guess locked in' : 'Lock in guess';
-      mapEl.classList.toggle('locked', locked);
+    const input = isDateMode()
+      ? createDatePicker(inputEl, { range: state.setup.range, initial: pending?.time, onChange: (time) => pick({ time }) })
+      : pinPicker(inputEl, pending, (latlng) => pick(latlng));
+    teardown.push(() => input.destroy());
+
+    function refresh() {
+      lockBtn.disabled = locked || !pending;
+      lockBtn.textContent = locked ? 'Guess locked in'
+        : pending ? 'Lock in guess'
+        : isDateMode() ? 'Pick a date' : 'Place a pin on the map';
+      input.setLocked(locked);
     }
-    if (pending) {
-      drawPending();
-      map.setView(pending, 4);
-    }
+    refresh();
 
     async function lockIn() {
       if (!pending || locked) return;
       locked = true;
-      drawPending();
-      const { lat, lng } = pending;
-      const res = await act('guess:submit', { lat, lng });
+      clearTimeout(draftTimer);
+      refresh();
+      const res = await act('guess:submit', pending);
       if (res.error) {
         locked = false;
-        drawPending();
+        refresh();
       }
     }
 
@@ -248,7 +253,44 @@ export function gameView(root, codeParam) {
     };
   }
 
+  function pinPicker(el, initial, onPick) {
+    const map = createMap(el);
+    let marker = null;
+    let locked = false;
+    const place = (latlng) => {
+      marker ??= L.marker(latlng, { icon: pinIcon(colorOf(state.you)), keyboard: false }).addTo(map);
+      marker.setLatLng(latlng);
+    };
+    map.on('click', (e) => {
+      if (locked) return;
+      place(e.latlng);
+      onPick({ lat: e.latlng.lat, lng: e.latlng.lng });
+    });
+    if (initial) {
+      place(initial);
+      map.setView(initial, 4);
+    }
+    return {
+      setLocked(value) {
+        locked = value;
+        el.classList.toggle('locked', value);
+      },
+      destroy: () => map.remove(),
+    };
+  }
+
   // ---------- Reveal ----------
+  /** Shows a finished round's answer and guesses; returns a cleanup function. */
+  function answerView(el, result) {
+    if (isDateMode()) {
+      el.replaceChildren();
+      renderTimeline(el, { answer: result.answer, guesses: result.guesses, colorOf });
+      return () => {};
+    }
+    const map = revealMap(el, result);
+    return () => map.remove();
+  }
+
   function revealMap(el, result) {
     const map = createMap(el);
     const { answer } = result;
@@ -259,7 +301,7 @@ export function gameView(root, codeParam) {
       const color = colorOf(g.playerId);
       L.polyline([[answer.lat, answer.lng], [g.guess.lat, lng]], { color, weight: 2, dashArray: '6 6', opacity: 0.9 }).addTo(map);
       L.marker([g.guess.lat, lng], { icon: dotIcon(color, g.name) })
-        .bindTooltip(`${escapeHtml(g.name)}: ${formatDistance(g.distanceKm)}`, { direction: 'top', offset: [0, -8] })
+        .bindTooltip(`${escapeHtml(g.name)}: ${formatDistance(g.distance)}`, { direction: 'top', offset: [0, -8] })
         .addTo(map);
       points.push([g.guess.lat, lng]);
     }
@@ -276,15 +318,14 @@ export function gameView(root, codeParam) {
 
   function renderReveal() {
     const result = state.reveal;
-    const mapEl = h('div', { class: 'map reveal-map' });
+    const mapEl = h('div', { class: isDateMode() ? 'panel reveal-timeline' : 'map reveal-map' });
     const side = h('aside', { class: 'reveal-side' });
     root.replaceChildren(h('section', { class: 'reveal' },
       h('div', { class: 'round-bar' },
         h('strong', {}, `Round ${result.index + 1} of ${state.totalRounds} result`),
         h('button', { class: 'link', type: 'button', onClick: leave }, 'Leave')),
       h('div', { class: 'reveal-body' }, mapEl, side)));
-    const map = revealMap(mapEl, result);
-    teardown.push(() => map.remove());
+    teardown.push(answerView(mapEl, result));
 
     ui.update = () => {
       const last = result.index + 1 >= state.totalRounds;
@@ -292,13 +333,14 @@ export function gameView(root, codeParam) {
       side.replaceChildren(
         h('figure', { class: 'reveal-photo' },
           h('img', { src: state.round.imageUrl, alt: result.answer.caption || 'This round’s picture' }),
-          result.answer.caption ? h('figcaption', {}, result.answer.caption) : null),
+          result.answer.caption ? h('figcaption', {}, result.answer.caption) : null,
+          isDateMode() ? h('p', { class: 'taken-at' }, `Taken ${formatTakenAt(result.answer.time)}`) : null),
         h('table', { class: 'results' },
-          h('thead', {}, h('tr', {}, h('th', {}, 'Player'), h('th', {}, 'Distance'), h('th', {}, 'Round'), h('th', {}, 'Total'))),
+          h('thead', {}, h('tr', {}, h('th', {}, 'Player'), h('th', {}, 'Off by'), h('th', {}, 'Round'), h('th', {}, 'Total'))),
           h('tbody', {}, result.guesses.map((g) => h('tr', { class: g.playerId === state.you ? 'me' : '' },
             h('td', {}, h('span', { class: 'swatch', style: { background: colorOf(g.playerId) } }), g.name),
-            h('td', {}, formatDistance(g.distanceKm),
-              g.guess && !g.locked ? h('small', { class: 'muted', title: 'Pin placed but not locked in before time ran out' }, ' unlocked') : null),
+            h('td', {}, formatOff(g.distance),
+              g.guess && !g.locked ? h('small', { class: 'muted', title: 'Picked but not locked in before time ran out' }, ' unlocked') : null),
             h('td', { class: 'num' }, `+${formatPoints(g.score)}`),
             h('td', { class: 'num' }, formatPoints(state.players.find((p) => p.id === g.playerId)?.total ?? 0)),
           )))),
@@ -315,14 +357,14 @@ export function gameView(root, codeParam) {
     const ranked = state.players;
     const podium = ranked.slice(0, 3);
     const roundScore = (round, playerId) => round.guesses.find((g) => g.playerId === playerId);
-    const mapEl = h('div', { class: 'map recap-map' });
+    const mapEl = h('div', { class: isDateMode() ? 'panel recap-timeline' : 'map recap-map' });
     let recap = 0;
-    let recapMap = null;
+    let cleanupRecap = null;
     const recapLabel = h('span');
     const showRecap = (i) => {
       recap = (i + state.history.length) % state.history.length;
-      recapMap?.remove();
-      recapMap = revealMap(mapEl, state.history[recap]);
+      cleanupRecap?.();
+      cleanupRecap = answerView(mapEl, state.history[recap]);
       recapLabel.textContent = `Round ${recap + 1}${state.history[recap].answer.caption ? `: ${state.history[recap].answer.caption}` : ''}`;
     };
 
@@ -340,7 +382,7 @@ export function gameView(root, codeParam) {
           h('td', {}, h('span', { class: 'swatch', style: { background: colorOf(p.id) } }), p.name),
           state.history.map((r) => {
             const g = roundScore(r, p.id);
-            return h('td', { class: 'num', title: g?.guess ? formatDistance(g.distanceKm) : 'No guess' }, g?.guess ? formatPoints(g.score) : '–');
+            return h('td', { class: 'num', title: g?.guess ? formatOff(g.distance) : 'No guess' }, g?.guess ? formatPoints(g.score) : '–');
           }),
           h('td', { class: 'num total' }, formatPoints(p.total))))))),
       h('div', { class: 'recap' },
@@ -352,7 +394,7 @@ export function gameView(root, codeParam) {
       h('p', {}, h('a', { class: 'btn primary', href: '#/', onClick: () => forgetPlayer(code) }, 'Back to start')),
     ));
     showRecap(0);
-    teardown.push(() => recapMap?.remove());
+    teardown.push(() => cleanupRecap?.());
   }
 
   return () => {
