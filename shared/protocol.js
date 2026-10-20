@@ -7,6 +7,15 @@
  */
 
 /**
+ * @typedef {object} ImmichSettings which Immich pictures a game draws from
+ * @property {string | null} albumId null = the whole library
+ * @property {boolean} favorites only pictures marked as favourite
+ * @property {boolean} cameraOnly skip pictures without a camera make (screenshots, messenger copies, scans)
+ * @property {string | null} from YYYY-MM-DD, taken on or after
+ * @property {string | null} to YYYY-MM-DD, taken on or before
+ */
+
+/**
  * @typedef {object} GameSettings
  * @property {Mode} mode
  * @property {Scoring} scoring
@@ -16,8 +25,9 @@
  * @property {Precision} precision date mode only
  * @property {number} orderSize pictures per round in order mode
  * @property {boolean} presenter the host runs a shared screen and doesn't play
- * @property {'set' | 'players'} source an existing picture set, or pictures the players add in the lobby
+ * @property {'set' | 'players' | 'immich'} source a picture set, pictures the players add in the lobby, or Immich
  * @property {string} [setId]
+ * @property {ImmichSettings} [immich]
  */
 
 /**
@@ -62,6 +72,7 @@
  * @property {number} index
  * @property {any} answer {lat, lng, caption} | {time, caption} | {order, pictures}
  * @property {string[]} imageUrls
+ * @property {(string | null)[] | null} links per picture, where the host can open the original (Immich); null for others
  * @property {ResultEntry[]} guesses best first, sitting-out players last
  */
 
@@ -85,7 +96,7 @@
  * @property {string} you
  * @property {string | null} hostId
  * @property {{id: string, name: string, connected: boolean} | null} presenter
- * @property {Omit<GameSettings, 'scale' | 'setId'>} settings
+ * @property {Omit<GameSettings, 'scale' | 'setId' | 'immich'>} settings
  * @property {number} totalRounds
  * @property {number | null} scale
  * @property {Setup | null} setup

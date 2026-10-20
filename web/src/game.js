@@ -139,8 +139,19 @@ export function gameView(root, codeParam) {
       s.mode === 'date' ? `dates ${PRECISION_LABEL[s.precision]}` : null,
       s.mode === 'order' ? `${s.orderSize} pictures per round` : null,
       s.scoring === 'placement' ? 'scored by placement' : 'scored in points',
+      s.source === 'immich' ? 'random pictures from Immich' : null,
     ].filter(Boolean);
     return `${parts.join(', ')}.`;
+  }
+
+  /** For the host: open the round's pictures in Immich. Other players don't get the links. */
+  function originalLinks(result) {
+    const links = result.links ?? [];
+    if (!links.some(Boolean)) return null;
+    const open = (href, label) => h('a', { href, target: '_blank', rel: 'noopener noreferrer' }, label);
+    return h('p', { class: 'original-links' }, links.length === 1
+      ? open(links[0], 'Open in Immich')
+      : ['Open in Immich: ', links.map((href, i) => (href ? [open(href, `picture ${i + 1}`), i < links.length - 1 ? ', ' : ''] : null))]);
   }
 
   // ---------- Lobby ----------
@@ -192,14 +203,22 @@ export function gameView(root, codeParam) {
         controls,
         h('button', { class: 'link', type: 'button', onClick: leave }, 'Leave game')),
     ));
+    let starting = false;
+    async function start() {
+      starting = true;
+      ui.update();
+      await act('game:start');
+      starting = false;
+      ui.update?.();
+    }
     ui.update = () => {
       players.replaceChildren(state.players.length
         ? playerList({ showPhotos: bringPhotos })
         : h('p', { class: 'muted' }, 'Nobody has joined yet. Players scan the code or open the invite link.'));
       const n = state.players.length;
       controls.replaceChildren(isHost()
-        ? h('button', { class: 'btn primary big', type: 'button', disabled: n === 0, onClick: () => act('game:start') },
-            n ? `Start game with ${n} player${n === 1 ? '' : 's'}` : 'Waiting for players')
+        ? h('button', { class: 'btn primary big', type: 'button', disabled: n === 0 || starting, onClick: start },
+            starting ? 'Starting…' : n ? `Start game with ${n} player${n === 1 ? '' : 's'}` : 'Waiting for players')
         : h('p', { class: 'waiting' }, `Waiting for ${hostName()} to start the game.`));
     };
   }
@@ -341,6 +360,7 @@ export function gameView(root, codeParam) {
           h('img', { src: result.imageUrls[0], alt: result.answer.caption || 'This round’s picture', onClick: () => lightbox(result.imageUrls[0]) }),
           result.answer.caption ? h('figcaption', {}, result.answer.caption) : null,
           m.answerNote?.(result, state)),
+        originalLinks(result),
         resultsTable(result),
         isHost()
           ? h('button', { class: 'btn primary big', type: 'button', onClick: () => act('round:next') },
@@ -360,6 +380,7 @@ export function gameView(root, codeParam) {
     let recap = 0;
     let cleanupRecap = null;
     const recapLabel = h('span');
+    const recapLinks = h('div');
     const showRecap = (i) => {
       recap = (i + state.history.length) % state.history.length;
       cleanupRecap?.();
@@ -367,6 +388,7 @@ export function gameView(root, codeParam) {
       cleanupRecap = m.renderAnswer(answerEl, state.history[recap], { state, colorOf });
       const caption = state.history[recap].answer.caption;
       recapLabel.textContent = `Round ${recap + 1}${caption ? `: ${caption}` : ''}`;
+      recapLinks.replaceChildren(...[originalLinks(state.history[recap])].filter(Boolean));
     };
     const unit = (n) => (placement ? `placement point${n === 1 ? '' : 's'}` : `point${n === 1 ? '' : 's'}`);
 
@@ -396,6 +418,7 @@ export function gameView(root, codeParam) {
           h('button', { class: 'btn', type: 'button', onClick: () => showRecap(recap - 1), 'aria-label': 'Previous round' }, 'Previous'),
           recapLabel,
           h('button', { class: 'btn', type: 'button', onClick: () => showRecap(recap + 1), 'aria-label': 'Next round' }, 'Next')),
+        recapLinks,
         answerEl),
       h('div', { class: 'finish-actions' },
         isHost() ? h('button', { class: 'btn primary', type: 'button', onClick: () => act('game:restart') }, 'Play again with everyone') : null,

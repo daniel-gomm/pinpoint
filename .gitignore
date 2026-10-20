@@ -4,3 +4,4 @@ data/
 e2e/.fixtures/
 test-results/
 playwright-report/
+.immich.env

@@ -1,5 +1,6 @@
 import { h, api, toast, store } from './util.js';
 import { connect, request, rememberPlayer } from './socket.js';
+import { immichStatus } from './immich.js';
 
 const MODE_CHOICES = [
   ['location', 'Place', 'Drop a pin where the picture was taken.'],
@@ -26,6 +27,23 @@ export function homeView(root) {
   const field = (label, control) => h('label', {}, label, control);
   const setSelect = h('select', { name: 'setId' }, h('option', { value: '' }, 'Loading sets…'));
   const setField = field('Picture set', setSelect);
+  /** @type {import('./immich.js').ImmichStatus | null} */
+  let immich = null;
+  const albumSelect = h('select', { name: 'albumId', onChange: update }, h('option', { value: '' }, 'Whole library'));
+  const libraryWarning = h('p', { class: 'hint' },
+    'Any picture in the library can come up, including private ones. Pick an album to choose what others see.');
+  const immichMissing = h('p', { class: 'warn' });
+  const immichFields = h('div', {},
+    immichMissing,
+    h('label', {}, 'Album', albumSelect),
+    libraryWarning,
+    h('div', { class: 'immich-options' },
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'favorites' }), h('span', {}, 'Favourites only')),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'cameraOnly', checked: true }),
+        h('span', {}, 'Camera photos only (skips screenshots and saved pictures, whose dates are often wrong)'))),
+    h('div', { class: 'row' },
+      field('Taken from', h('input', { name: 'from', type: 'date' })),
+      field('Taken until', h('input', { name: 'to', type: 'date' }))));
   const precisionField = field('How exact', h('select', { name: 'precision' },
     h('option', { value: 'minute' }, 'Day and time of day'),
     h('option', { value: 'day' }, 'Day'),
@@ -46,12 +64,15 @@ export function homeView(root) {
       h('legend', {}, 'What do players guess?'),
       MODE_CHOICES.map(([value, title, text]) => h('label', { class: 'choice' },
         radio('mode', value, value === 'location'), h('strong', {}, title), h('span', {}, text)))),
-    h('fieldset', { class: 'choices' },
+    h('fieldset', { class: 'choices three' },
       h('legend', {}, 'Pictures'),
-      h('label', { class: 'choice' }, radio('source', 'set', true), h('strong', {}, 'From a picture set'), h('span', {}, 'Pictures you prepared.')),
+      h('label', { class: 'choice' }, radio('source', 'set', true), h('strong', {}, 'Picture set'), h('span', {}, 'Pictures you prepared.')),
+      h('label', { class: 'choice' }, radio('source', 'immich', false), h('strong', {}, 'Immich'),
+        h('span', {}, 'Random pictures from your photo library.')),
       h('label', { class: 'choice' }, radio('source', 'players', false), h('strong', {}, 'Players bring them'),
         h('span', {}, 'Everyone adds their own in the lobby.'))),
     setField,
+    immichFields,
     precisionField,
     orderSizeField,
     h('div', { class: 'row' },
@@ -87,7 +108,11 @@ export function homeView(root) {
     const v = values();
     const [countKey, needed] = NEEDS[String(v.mode)];
     const fromSet = v.source === 'set';
+    const fromImmich = v.source === 'immich';
     setField.hidden = !fromSet;
+    immichFields.hidden = !fromImmich;
+    libraryWarning.hidden = Boolean(v.albumId);
+    if (fromImmich) loadImmich();
     precisionField.hidden = v.mode !== 'date';
     orderSizeField.hidden = v.mode !== 'order';
     scaleField.hidden = v.mode === 'order';
@@ -104,7 +129,32 @@ export function homeView(root) {
       ? playable.map((s) => h('option', { value: s.id, selected: s.id === selected },
           `${s.name} (${s[countKey]} with a ${needed})`))
       : [h('option', { value: '' }, `No sets with ${needed}s yet`)]));
-    submit.disabled = fromSet && !playable.length;
+    submit.disabled = (fromSet && !playable.length) || (fromImmich && (!immich?.connected || Boolean(immich.error)));
+  }
+
+  let immichLoading = null;
+  function loadImmich() {
+    immichLoading ??= (async () => {
+      immichMissing.textContent = 'Checking Immich…';
+      try {
+        immich = await immichStatus();
+        if (!immich.connected) {
+          immichMissing.replaceChildren('Immich is not connected yet. ', h('a', { href: '#/sets' }, 'Connect it on the Picture sets page.'));
+          return;
+        }
+        if (immich.error) {
+          immichMissing.textContent = immich.error;
+          return;
+        }
+        immichMissing.textContent = '';
+        const albums = await api('/api/immich/albums');
+        albumSelect.append(...albums.map((a) => h('option', { value: a.id }, `${a.name} (${a.count})`)));
+      } catch (err) {
+        immichMissing.textContent = err.message;
+      } finally {
+        update();
+      }
+    })();
   }
 
   api('/api/sets').then((result) => {
@@ -129,6 +179,8 @@ export function homeView(root) {
     const v = values();
     store.set('gg:name', String(v.name).trim());
     connect();
+    submit.disabled = true;
+    submit.textContent = v.source === 'immich' ? 'Picking pictures…' : 'Creating…';
     const res = await request('game:create', {
       setId: v.setId,
       name: v.name,
@@ -141,10 +193,15 @@ export function homeView(root) {
         precision: v.precision,
         orderSize: Number(v.orderSize),
         presenter: Boolean(v.presenter),
+        immich: v.source === 'immich'
+          ? { albumId: v.albumId || null, favorites: Boolean(v.favorites), cameraOnly: Boolean(v.cameraOnly), from: v.from || null, to: v.to || null }
+          : undefined,
         // the server takes km for location and hours for date
         scale: v.scale ? Number(v.scale) * (v.mode === 'date' ? 24 : 1) : undefined,
       },
     });
+    submit.textContent = 'Create game';
+    update();
     if (res.error) return toast(res.error, 'error');
     rememberPlayer(res.code, res.playerId);
     location.hash = `#/game/${res.code}`;

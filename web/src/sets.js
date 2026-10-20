@@ -1,6 +1,7 @@
 import { h, api, toast, IMAGE_ACCEPT, isImageFile } from './util.js';
 import { createMap, pinIcon, L } from './map.js';
 import { uploadPhoto } from './upload.js';
+import { immichPanel } from './immich.js';
 
 export function setListView(root) {
   const list = h('div', { class: 'set-grid' });
@@ -13,7 +14,7 @@ export function setListView(root) {
       h('h1', {}, 'Picture sets'),
       h('button', { class: 'btn', type: 'button', onClick: () => importInput.click() }, 'Import a set'), importInput),
     h('p', { class: 'muted' }, 'A set is a collection of photos with where and when each was taken. Games draw their rounds from one set.'),
-    form, list));
+    form, list, immichPanel()));
 
   api('/api/sets').then((sets) => {
     if (!sets.length) {

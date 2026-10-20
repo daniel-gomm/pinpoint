@@ -8,10 +8,13 @@ export function connect() {
   return socket;
 }
 
+// Starting a game may wait for Immich to pick pictures.
+const SLOW = ['game:create', 'game:start'];
+
 export function request(event, payload = {}) {
   return new Promise((resolve) => {
     connect()
-      .timeout(8000)
+      .timeout(SLOW.includes(event) ? 30000 : 8000)
       .emit(event, payload, (err, res) => resolve(err ? { error: 'The server did not respond. Check your connection.' } : res));
   });
 }

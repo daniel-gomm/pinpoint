@@ -435,3 +435,16 @@ body.presenting .results { font-size: 1.1rem; }
   .order-strip { grid-auto-flow: row; grid-template-columns: 1fr 1fr; }
   .order-row { grid-template-columns: 1fr; }
 }
+
+/* ---------- Immich ---------- */
+.immich-panel { margin-top: 2.5rem; padding: 1.25rem 1.5rem; background: var(--card); border: 1.5px solid var(--line); border-radius: var(--radius-l); max-width: 46rem; }
+.immich-panel > p { margin-top: 0; }
+.immich-form { display: grid; grid-template-columns: 1fr 1fr auto; gap: 0.75rem; align-items: end; }
+.immich-form label { margin: 0; }
+.immich-form .hint { grid-column: 1 / -1; }
+.immich-options { display: grid; gap: 0.4rem; margin-bottom: 0.9rem; }
+.immich-options label.check { margin: 0; }
+@media (max-width: 640px) {
+  .immich-form { grid-template-columns: 1fr; }
+}
+.original-links { margin: 0.25rem 0 0.75rem; font-size: 0.9rem; }

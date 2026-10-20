@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Game, GameError } from './game.js';
 import { MODES, PRECISIONS, ORDER_SIZES } from './modes.js';
+import { ImmichError } from './immich.js';
 
 const CODE_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ'; // no I/O to avoid confusion
 const IDLE_MS = 3 * 60 * 60 * 1000;
@@ -13,6 +14,17 @@ const clampInt = (value, min, max, fallback) => {
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
 };
 const oneOf = (value, options, fallback) => (options.includes(value) ? value : fallback);
+const SOURCES = ['set', 'players', 'immich'];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const day = (value) => (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(value)) ? value : null);
+
+/** @returns {import('../../shared/protocol.js').ImmichSettings} */
+function cleanImmich(raw = {}) {
+  const albumId = typeof raw.albumId === 'string' && UUID_RE.test(raw.albumId) ? raw.albumId : null;
+  let [from, to] = [day(raw.from), day(raw.to)];
+  if (from && to && from > to) [from, to] = [to, from];
+  return { albumId, favorites: Boolean(raw.favorites), cameraOnly: raw.cameraOnly !== false, from, to };
+}
 
 /** @returns {import('../../shared/protocol.js').GameSettings} */
 export function cleanSettings(raw = {}) {
@@ -27,11 +39,17 @@ export function cleanSettings(raw = {}) {
     precision: oneOf(raw.precision, PRECISIONS, 'minute'),
     orderSize: oneOf(Number(raw.orderSize), ORDER_SIZES, 4),
     presenter: Boolean(raw.presenter),
-    source: raw.source === 'players' ? 'players' : 'set',
+    source: oneOf(raw.source, SOURCES, 'set'),
+    ...(raw.source === 'immich' ? { immich: cleanImmich(raw.immich ?? {}) } : {}),
   };
 }
 
-export function setupSockets(io, store, { dataDir }) {
+/**
+ * @param {import('socket.io').Server} io
+ * @param {import('./sets.js').SetStore} store
+ * @param {{dataDir: string, sources: ReturnType<typeof import('./sources.js').createSources>}} opts
+ */
+export function setupSockets(io, store, { dataDir, sources }) {
   /** @type {Map<string, Game>} */
   const games = new Map();
   const saveFile = path.resolve(dataDir, 'games.json');
@@ -44,12 +62,6 @@ export function setupSockets(io, store, { dataDir }) {
     } while (games.has(code));
     return code;
   }
-
-  const loadPool = (setId) => () => {
-    const set = store.get(setId);
-    if (!set) throw new GameError('The picture set for this game was deleted.');
-    return { set, images: set.images };
-  };
 
   async function broadcast(game) {
     const sockets = await io.in(game.code).fetchSockets();
@@ -71,6 +83,7 @@ export function setupSockets(io, store, { dataDir }) {
     game.onChange = () => {
       broadcast(game);
       scheduleSave();
+      sources.prefetch(game);
     };
   }
 
@@ -82,7 +95,7 @@ export function setupSockets(io, store, { dataDir }) {
     for (const data of saved) {
       if (data.lastActivity < Date.now() - IDLE_MS) continue;
       try {
-        register(Game.fromJSON(data, { loadPool: loadPool(data.settings.setId) }));
+        register(Game.fromJSON(data, {}));
       } catch (err) {
         console.error(`Could not restore game ${data.code}:`, err.message);
       }
@@ -105,13 +118,14 @@ export function setupSockets(io, store, { dataDir }) {
   }
 
   // Wraps a handler so thrown GameErrors become `{ error }` acks instead of crashing.
-  const handle = (fn) => (payload, ack) => {
+  const handle = (fn) => async (payload, ack) => {
     const reply = typeof ack === 'function' ? ack : () => {};
     try {
-      reply({ ok: true, ...(fn(payload ?? {}) ?? {}) });
+      reply({ ok: true, ...((await fn(payload ?? {})) ?? {}) });
     } catch (err) {
-      if (!(err instanceof GameError)) console.error(err);
-      reply({ error: err instanceof GameError ? err.message : 'Something went wrong on the server.' });
+      const shown = err instanceof GameError || err instanceof ImmichError;
+      if (!shown) console.error(err);
+      reply({ error: shown ? err.message : 'Something went wrong on the server.' });
     }
   };
 
@@ -142,20 +156,22 @@ export function setupSockets(io, store, { dataDir }) {
   }
 
   io.on('connection', (socket) => {
-    socket.on('game:create', handle(({ setId, name, settings: raw }) => {
+    socket.on('game:create', handle(async ({ setId, name, settings: raw }) => {
       const settings = cleanSettings(raw);
+      if (settings.source === 'set') {
+        if (!store.get(String(setId))) throw new GameError('That picture set does not exist.');
+        settings.setId = String(setId);
+      }
+      const pool = settings.source === 'players' ? null : await sources.pool(settings);
       const code = newCode();
       if (settings.source === 'players') {
         const day = new Date().toISOString().slice(0, 10);
         settings.setId = store.create(`Photos from game ${code} (${day})`, { fromGame: code }).id;
-      } else {
-        if (!store.get(String(setId))) throw new GameError('That picture set does not exist.');
-        settings.setId = String(setId);
       }
-      const game = new Game({ code, settings, loadPool: loadPool(settings.setId) });
-      if (settings.source === 'set') {
-        // Fail early when the set can't support this game, and show the real number of rounds.
-        settings.rounds = game.prepare();
+      const game = new Game({ code, settings });
+      if (pool) {
+        // Fail early when the pictures can't support this game, and show the real number of rounds.
+        settings.rounds = game.prepare(pool);
         game.rounds = [];
       }
       const host = settings.presenter ? game.addPresenter(name) : game.addPlayer(name);
@@ -181,7 +197,12 @@ export function setupSockets(io, store, { dataDir }) {
     }));
 
     socket.on('game:leave', handle(() => detach(socket)));
-    socket.on('game:start', handle(() => gameOf(socket).start(socket.data.playerId)));
+    socket.on('game:start', handle(async () => {
+      const game = gameOf(socket);
+      game.checkStart(socket.data.playerId);
+      const pool = await sources.pool(game.settings);
+      game.start(socket.data.playerId, pool);
+    }));
     socket.on('game:restart', handle(() => gameOf(socket).restart(socket.data.playerId)));
     socket.on('game:kick', handle(({ playerId }) => gameOf(socket).kick(socket.data.playerId, playerId)));
     socket.on('round:next', handle(() => gameOf(socket).next(socket.data.playerId)));

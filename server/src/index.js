@@ -8,15 +8,20 @@ import { lanAddresses } from './network.js';
 import { isDated, isLocated, parseTakenAt } from './modes.js';
 import { processImage, ImageError } from './images.js';
 import { PHASES } from './game.js';
+import { ImmichConfig, ImmichClient, ImmichError } from './immich.js';
+import { createSources } from './sources.js';
+import { GameError } from './errors.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 const DATA_DIR = process.env.DATA_DIR || './data';
 
 const store = new SetStore(DATA_DIR);
+const immich = new ImmichConfig(DATA_DIR);
+const sources = createSources({ store, immich });
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { maxHttpBufferSize: 1e5 });
-const { games, refreshContributions, saveNow } = setupSockets(io, store, { dataDir: DATA_DIR });
+const { games, refreshContributions, saveNow } = setupSockets(io, store, { dataDir: DATA_DIR, sources });
 
 const photoUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 40 * 1024 * 1024, files: 1 } });
 const zipUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024, files: 1 } });
@@ -84,6 +89,46 @@ app.get('/api/info', (req, res) => {
   const detect = process.env.LAN_DETECT !== 'false';
   res.json({ publicUrl: process.env.PUBLIC_URL || null, lanAddresses: detect ? lanAddresses() : [] });
 });
+
+// ---------- Immich ----------
+// The API key stays on the server: it is never sent back, and players only see re-encoded pictures.
+
+app.get('/api/immich', route(async (req, res) => {
+  const client = immich.client();
+  if (!client) return res.json({ connected: false, fromEnv: false });
+  const base = { connected: true, fromEnv: immich.fromEnv, url: client.url };
+  try {
+    res.json({ ...base, ...(await client.status()) });
+  } catch (err) {
+    if (!(err instanceof ImmichError)) throw err;
+    res.json({ ...base, error: err.message });
+  }
+}));
+
+app.put('/api/immich', route(async (req, res) => {
+  if (immich.fromEnv) throw new HttpError(409, 'Immich is set up through IMMICH_URL and IMMICH_API_KEY on the server.');
+  const apiKey = String(req.body?.apiKey ?? '').trim();
+  if (!apiKey) throw new HttpError(400, 'Paste an API key from Immich (Account Settings → API Keys).');
+  const client = new ImmichClient({ url: req.body?.url, apiKey });
+  const status = await client.status();
+  if (status.missing.length) {
+    throw new HttpError(400, `The API key needs these permissions too: ${status.missing.join(', ')}.`);
+  }
+  immich.save({ url: client.url, apiKey });
+  res.json({ connected: true, fromEnv: false, ...status });
+}));
+
+app.delete('/api/immich', (req, res) => {
+  if (immich.fromEnv) throw new HttpError(409, 'Immich is set up through IMMICH_URL and IMMICH_API_KEY on the server.');
+  immich.clear();
+  res.status(204).end();
+});
+
+app.get('/api/immich/albums', route(async (req, res) => {
+  const client = immich.client();
+  if (!client) throw new HttpError(409, 'Immich is not connected.');
+  res.json(await client.albums());
+}));
 
 // ---------- picture sets ----------
 
@@ -187,17 +232,19 @@ app.get('/api/sets/:id/files/:file', (req, res, next) => {
 
 const requireGame = (code) => games.get(String(code).toUpperCase()) ?? (() => { throw notFound('Game'); })();
 
-app.get('/api/games/:code/images/:index/:slot?', (req, res) => {
+app.get('/api/games/:code/images/:index/:slot?', route(async (req, res) => {
   const game = requireGame(req.params.code);
   const { index, slot = 0 } = /** @type {{index: string, slot?: string}} */ (req.params);
   const image = game.imageFor(Number(index), Number(slot));
   if (!image) throw notFound('Picture');
-  res.sendFile(store.filePath(game.settings.setId, image.file), { maxAge: '1h' });
-});
+  const out = await sources.file(game, image);
+  if ('file' in out) return res.sendFile(out.file, { maxAge: '1h' });
+  res.set('Cache-Control', 'private, max-age=3600').type('jpeg').send(out.buffer);
+}));
 
 app.get('/api/games/:code/map', (req, res) => {
   const game = requireGame(req.params.code);
-  const map = store.get(game.settings.setId)?.map;
+  const map = game.settings.setId ? store.get(game.settings.setId)?.map : null;
   if (!map) throw notFound('Map');
   res.sendFile(store.filePath(game.settings.setId, map.file), { maxAge: '1h' });
 });
@@ -266,8 +313,8 @@ app.use((err, req, res, next) => {
     const msg = err.code === 'LIMIT_FILE_SIZE' ? 'That file is too large.' : err.message;
     return res.status(400).json({ error: msg });
   }
-  if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
-  if (err instanceof ImageError || err instanceof SetError) return res.status(400).json({ error: err.message });
+  if (err instanceof HttpError || err instanceof ImmichError) return res.status(err.status).json({ error: err.message });
+  if (err instanceof ImageError || err instanceof SetError || err instanceof GameError) return res.status(400).json({ error: err.message });
   console.error(err);
   res.status(500).json({ error: 'Something went wrong on the server.' });
 });

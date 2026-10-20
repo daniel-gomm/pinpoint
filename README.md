@@ -29,12 +29,27 @@ Games survive a server restart (`docker compose restart`): players reconnect aut
 - **Export / import:** download a set as a zip and import it elsewhere.
 - The server re-encodes every upload (rotation, max 2400 px, JPEG), which strips all metadata, so players can't read the answer from the file.
 
+## Immich
+
+Games can draw random pictures straight from an [Immich](https://immich.app) photo library, with nothing to upload or prepare.
+
+1. In Immich, create an API key under **Account Settings → API Keys** with the permissions `asset.read`, `asset.view` and `album.read` (`user.read` also shows whose library is connected).
+2. On the **Picture sets** page, enter the Immich address and the key. Alternatively set `IMMICH_URL` and `IMMICH_API_KEY` for the server, e.g. in a `.env` file next to `docker-compose.yml`.
+3. When hosting, pick **Immich** as the picture source and choose an album or the whole library. Optional filters: favourites only, a date range, and camera photos only (on by default; skips screenshots and saved pictures, whose dates are often just file dates).
+
+How it works:
+
+- The key is stored on the server only (`data/immich.json`, readable by the server's user). Players never see it or the Immich address; the host gets an "Open in Immich" link after each round.
+- At game start the server draws up to 1,000 random pictures matching the filter, keeps one per hour (bursts look alike) and picks the rounds from those that have a location (Place) or date (Date, Order). Place names from Immich become the captions.
+- A round's picture is fetched from Immich when the round starts and the next one during the reveal, then re-encoded like uploads. Nothing is written to disk.
+- **Whole library** means any picture can come up, including private ones and photos of documents. Pick an album to control what others see.
+
 ## Hosting a game
 
 | Setting | Options |
 |---|---|
 | What players guess | **Place** (pin on the map), **Date** (timeline; precision: day + time, day, month or year), **Order** (sort 3–6 pictures from oldest to newest) |
-| Pictures | From a **picture set**, or **players bring them**: everyone uploads their own in the lobby and sits out the rounds with their own pictures (they get the average of the others' scores for that round) |
+| Pictures | From a **picture set**, from **Immich** (an album or the whole library), or **players bring them**: everyone uploads their own in the lobby and sits out the rounds with their own pictures (they get the average of the others' scores for that round) |
 | Scoring | **Placement** (default): a point for every player you were closer than, ties count half, so one big miss costs at most last place. **Points**: up to 5,000 per round by distance. Placement totals are tie-broken by points. |
 | Shared screen | The host's device becomes a **presenter**: it shows the pictures, timer and results (e.g. on a TV) and doesn't play. |
 
@@ -59,7 +74,7 @@ cd web && npm run dev                         # http://localhost:5173, proxies t
 Checks, from the repository root:
 
 ```sh
-npm test         # server unit tests (game engine, scoring, images, sets)
+npm test         # server unit tests (game engine, scoring, images, sets, Immich against a fake server)
 npm run check    # type check of server and client (JSDoc + shared/protocol.js)
 npx playwright install chromium   # once
 npm run e2e      # browser tests: starts a throwaway server and Vite on ports 3999/5199
@@ -67,4 +82,4 @@ npm run e2e      # browser tests: starts a throwaway server and Vite on ports 39
 
 `HEIC_SAMPLE=/path/to/photo.heic npm test` also runs the HEIC conversion test. `CHROMIUM_PATH=/path/to/chrome npm run e2e` uses an existing Chromium instead of installing one.
 
-Code layout: `server/src/modes.js` holds what differs per game mode on the server (validation, distance, scoring, answer), `server/src/game.js` the round flow, `web/src/modes/` the matching guessing and reveal UI, and `shared/protocol.js` the types of the messages between them.
+Code layout: `server/src/modes.js` holds what differs per game mode on the server (validation, distance, scoring, answer), `server/src/game.js` the round flow, `server/src/sources.js` where pictures come from (sets, or Immich via `server/src/immich.js`), `web/src/modes/` the matching guessing and reveal UI, and `shared/protocol.js` the types of the messages between them.

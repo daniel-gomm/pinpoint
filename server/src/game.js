@@ -14,6 +14,8 @@ export { GameError };
 /** @typedef {import('../../shared/protocol.js').Snapshot} Snapshot */
 /** @typedef {{ set: {id: string, name: string, map?: any}, images: any[] }} Pool */
 
+const POOL_OWNER = { set: 'This picture set has', players: 'The players have added', immich: 'Immich has' };
+
 const READY_HINT = { location: 'a location', date: 'a date', order: 'a date' };
 
 export class Game {
@@ -21,7 +23,7 @@ export class Game {
    * @param {object} opts
    * @param {string} opts.code
    * @param {GameSettings} opts.settings
-   * @param {() => Pool} opts.loadPool the pictures to play with, read when a game (re)starts
+   * @param {() => Pool} [opts.loadPool] the pictures to play with, when start() isn't given them
    * @param {() => void} [opts.onChange] called whenever clients should get a fresh snapshot
    * @param {() => number} [opts.now]
    */
@@ -131,13 +133,17 @@ export class Game {
 
   // ---------- flow ----------
 
-  /** Draws the rounds from the current pictures. Throws if there aren't enough. */
-  prepare() {
-    const { set, images } = this.loadPool();
+  /**
+   * Draws the rounds from the available pictures. Throws if there aren't enough.
+   * @param {Pool} [available] defaults to what loadPool returns
+   */
+  prepare(available = this.loadPool?.()) {
+    if (!available) throw new GameError('There are no pictures to play with.');
+    const { set, images } = available;
     const pool = images.filter((i) => this.objective.isReady(i));
     const needed = this.objective.minPool(this.settings);
     if (pool.length < needed) {
-      const what = this.settings.source === 'players' ? 'The players have added' : 'This picture set has';
+      const what = POOL_OWNER[this.settings.source] ?? POOL_OWNER.set;
       throw new GameError(needed > 1
         ? `${what} ${pool.length} pictures with ${READY_HINT[this.settings.mode]}; this game needs at least ${needed}.`
         : `${what} no pictures with ${READY_HINT[this.settings.mode]} yet.`);
@@ -153,12 +159,18 @@ export class Game {
     return this.rounds.length;
   }
 
-  start(byId) {
+  /** @param {Pool} [pool] */
+  start(byId, pool) {
+    this.checkStart(byId);
+    this.prepare(pool);
+    this.startRound();
+  }
+
+  /** Throws unless this person may start the game now. */
+  checkStart(byId) {
     this.requireHost(byId);
     if (this.phase !== PHASES.LOBBY) throw new GameError('The game has already started.');
     if (this.players.size === 0) throw new GameError('Wait for at least one player to join.');
-    this.prepare();
-    this.startRound();
   }
 
   next(byId) {
@@ -320,13 +332,16 @@ export class Game {
       .sort((a, b) => b.total - a.total || b.points - a.points || a.name.localeCompare(b.name));
   }
 
-  publicResult(index) {
+  publicResult(index, viewerId) {
     const round = this.rounds[index];
     const last = (e) => (e.sitOut ? 1 : 0);
+    const links = round.images.map((i) => i.link ?? null);
     return {
       index,
       answer: this.objective.answer(round.images, this.context()),
       imageUrls: this.imageUrls(index),
+      // Where the host can open the original (e.g. in Immich); other players don't get the address.
+      links: viewerId === this.hostId && links.some(Boolean) ? links : null,
       guesses: this.results[index].entries
         .map((e) => ({ ...e, name: this.nameOf(e.playerId) }))
         .sort((a, b) => last(a) - last(b) || b.score - a.score || b.points - a.points),
@@ -378,8 +393,8 @@ export class Game {
         myGuess: inRound ? this.guesses.get(viewerId) ?? null : null,
         myDraft: inRound ? this.drafts.get(viewerId) ?? null : null,
       },
-      reveal: this.phase === PHASES.REVEAL ? this.publicResult(this.roundIndex) : null,
-      history: this.phase === PHASES.FINISHED ? this.results.map((_, i) => this.publicResult(i)) : null,
+      reveal: this.phase === PHASES.REVEAL ? this.publicResult(this.roundIndex, viewerId) : null,
+      history: this.phase === PHASES.FINISHED ? this.results.map((_, i) => this.publicResult(i, viewerId)) : null,
     };
   }
 
@@ -411,7 +426,7 @@ export class Game {
   /**
    * Rebuilds a saved game. Everyone starts disconnected; a running round keeps its deadline.
    * @param {any} data from toJSON()
-   * @param {{loadPool: () => Pool, onChange?: () => void, now?: () => number}} opts
+   * @param {{loadPool?: () => Pool, onChange?: () => void, now?: () => number}} opts
    */
   static fromJSON(data, { loadPool, onChange, now = Date.now }) {
     const game = new Game({ code: data.code, settings: data.settings, loadPool, now });
