@@ -1,0 +1,25 @@
+services:
+  server:
+    build: ./server
+    restart: unless-stopped
+    # Host networking lets the server see this machine's Wi-Fi/LAN address for invite links.
+    network_mode: host
+    volumes:
+      - ./data:/data
+    environment:
+      - DATA_DIR=/data
+      - PORT=${SERVER_PORT:-3737}
+      # Set to override invite links, e.g. PUBLIC_URL=http://192.168.1.20:8080
+      - PUBLIC_URL=${PUBLIC_URL:-}
+
+  web:
+    build: ./web
+    restart: unless-stopped
+    depends_on:
+      - server
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      - SERVER_PORT=${SERVER_PORT:-3737}
+    ports:
+      - "${PORT:-8080}:80"
