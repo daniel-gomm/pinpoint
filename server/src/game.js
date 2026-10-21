@@ -154,7 +154,7 @@ export class Game {
     // Derived from every ready picture, not just the drawn rounds, so it says less about them.
     this.setup = this.objective.setup(pool, ctx);
     this.rounds = this.objective
-      .drawRounds(pool, this.settings.rounds, this.settings, this.played)
+      .drawRounds(pool, this.settings.rounds, ctx, this.played)
       .map((roundImages) => ({ images: roundImages, sitOut: this.objective.sitOut(roundImages) }));
     return this.rounds.length;
   }

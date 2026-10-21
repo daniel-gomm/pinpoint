@@ -173,8 +173,8 @@ async function partnerLibrary(client, userId, settings, needed) {
   const months = await timelineMonthsInRange(client, userId, settings.immich);
   const total = months.reduce((sum, m) => sum + m.count, 0);
 
-  // Months picked at random, weighted by size; many of them, so the pictures span their library.
-  const picked = weightedShuffle(months, (m) => m.count).slice(0, MAX_PARTNER_MONTHS).map((m) => m.timeBucket);
+  // Many months, picked regardless of size so busy ones (holidays) don't crowd out the rest.
+  const picked = shuffle(months).slice(0, MAX_PARTNER_MONTHS).map((m) => m.timeBucket);
   const day = (takenAt) => takenAt.slice(0, 10);
   const pool = (await mapLimit(picked, CONCURRENCY, (month) => client.timelineMonth(month, { userId, favorites: settings.immich.favorites })))
     .flat()
@@ -211,15 +211,6 @@ export function mix(libraries, atLeast) {
     taken[i] = Math.min(shuffled[i].length, taken[i] + short);
   }
   return shuffled.flatMap((images, i) => images.slice(0, taken[i]));
-}
-
-/** Items in random order, heavier ones more likely to come early. */
-function weightedShuffle(items, weight) {
-  // Efraimidis–Spirakis: sort by u^(1/w)
-  return items
-    .map((item) => ({ item, key: Math.random() ** (1 / Math.max(1, weight(item))) }))
-    .sort((a, b) => b.key - a.key)
-    .map((x) => x.item);
 }
 
 async function mapLimit(items, limit, fn) {
