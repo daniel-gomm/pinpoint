@@ -34,14 +34,15 @@ Games survive a server restart (`docker compose restart`): players reconnect aut
 
 Games can draw random pictures straight from an [Immich](https://immich.app) photo library, with nothing to upload or prepare.
 
-1. In Immich, create an API key under **Account Settings → API Keys** with the permissions `asset.read`, `asset.view` and `album.read` (`user.read` also shows whose library is connected).
+1. In Immich, create an API key under **Account Settings → API Keys** with the permissions `asset.read`, `asset.view` and `album.read` (`user.read` also shows whose library is connected). To include photos partners share with you, add `partner.read` and `timeline.read`.
 2. On the **Picture sets** page, enter the Immich address and the key. Alternatively set `IMMICH_URL` and `IMMICH_API_KEY` for the server, e.g. in a `.env` file next to `docker-compose.yml`.
-3. When hosting, pick **Immich** as the picture source and choose an album or the whole library. Optional filters: favourites only, a date range, and camera photos only (on by default; skips screenshots and saved pictures, whose dates are often just file dates).
+3. When hosting, pick **Immich** as the picture source and choose an album or the whole library. Optional filters: favourites only, a date range, and camera photos only (on by default; skips screenshots and saved pictures, whose dates are often just file dates). With the whole library you can also include the photos of partners who share their library with you.
 
 How it works:
 
 - The key is stored on the server only (`data/immich.json`, readable by the server's user). Players never see it or the Immich address; the host gets an "Open in Immich" link after each round.
-- At game start the server draws up to 1,000 random pictures matching the filter, keeps one per hour (bursts look alike) and picks the rounds from those that have a location (Place) or date (Date, Order). Place names from Immich become the captions.
+- At game start the server draws up to 1,000 random pictures matching the filter, keeps one per hour (bursts look alike) and picks the rounds from those that have a location (Place) or date (Date, Order). Place names from Immich become the captions. From an album it reads all its pictures instead, including those others shared in it (random search only covers your own).
+- Immich's search ignores partners, so their pictures are sampled from up to 24 random months of their timeline and loaded one by one (about twice what the game needs; this adds a few seconds). Each library makes up its share of the rounds by how many pictures it holds.
 - A round's picture is fetched from Immich when the round starts and the next one during the reveal, then re-encoded like uploads. Nothing is written to disk.
 - **Whole library** means any picture can come up, including private ones and photos of documents. Pick an album to control what others see.
 

@@ -10,6 +10,14 @@ import { processImage } from './images.js';
 const CACHE_SIZE = 80;
 // More random draws when the first one has too few usable pictures (e.g. few geotagged ones).
 const MAX_DRAWS = 3;
+// Pages of 1000 read from an album; beyond that only its newest pictures are used.
+const MAX_ALBUM_PAGES = 10;
+// Partner pictures are sampled from their timeline, then loaded one by one for their camera data.
+// That takes ~50 ms per picture, so only about twice what the game needs are loaded.
+const MIN_PARTNER_SAMPLE = 30;
+const MAX_PARTNER_SAMPLE = 200;
+const MAX_PARTNER_MONTHS = 24;
+const CONCURRENCY = 8;
 
 /**
  * Where a game's pictures come from: a picture set on disk, or an Immich server.
@@ -35,26 +43,51 @@ export function createSources({ store, immich }) {
     }
     const client = immichClient();
     const filter = immichFilter(settings.immich);
-    const { albumId, favorites } = settings.immich;
-    const name = albumId ? (await client.album(albumId).catch(albumGone)).albumName : 'Immich library';
-
+    const { albumId, favorites, partners: withPartners } = settings.immich;
     const objective = MODES[settings.mode];
     const needed = settings.rounds * objective.minPool(settings);
+    let name = albumId ? (await client.album(albumId).catch(albumGone)).albumName : 'Immich library';
+
     /** @type {Map<string, any>} */
     const found = new Map();
-    for (let draw = 0; draw < MAX_DRAWS; draw++) {
-      const assets = await client.random(filter);
+    const add = (assets) => {
       for (const asset of assets) {
         const image = toImage(asset, settings.immich, client);
         if (image) found.set(image.id, image);
       }
-      const ready = [...found.values()].filter((i) => objective.isReady(i)).length;
-      // A short answer means the filter matched fewer pictures than one draw returns: we have them all.
-      if (assets.length < 1000 || ready >= needed * 2) break;
+    };
+    if (albumId) {
+      // Random search only covers the user's own pictures, so a shared album would come up nearly
+      // empty. Albums are usually small enough to list.
+      for (let page = 1, n = 0; page && n < MAX_ALBUM_PAGES; n++) {
+        const { items, next } = await client.search(filter, page);
+        add(items);
+        page = next;
+      }
+    } else {
+      for (let draw = 0; draw < MAX_DRAWS; draw++) {
+        const assets = await client.random(filter);
+        add(assets);
+        const ready = [...found.values()].filter((i) => objective.isReady(i)).length;
+        // A short answer means the filter matched fewer pictures than one draw returns: we have them all.
+        if (assets.length < 1000 || ready >= needed * 2) break;
+      }
+    }
+    let images = spreadOut([...found.values()]);
+
+    if (withPartners && !albumId) {
+      const partners = await client.partners();
+      if (!partners) throw new GameError('To include partner photos, add the partner.read and timeline.read permissions to the Immich API key.');
+      if (partners.length) {
+        const libraries = [{ images: images.filter((i) => objective.isReady(i)), total: await timelineTotal(client, null, settings.immich) }];
+        for (const partner of partners) libraries.push(await partnerLibrary(client, partner.id, settings, needed));
+        images = spreadOut(mix(libraries, needed * 2));
+        name = `${name} and ${partners.map((p) => p.name).join(', ')}`;
+      }
     }
     return {
       set: { id: albumId ?? 'library', name: favorites ? `${name} (favourites)` : name, map: null },
-      images: spreadOut([...found.values()]),
+      images,
     };
   }
 
@@ -99,6 +132,90 @@ export function createSources({ store, immich }) {
   }
 
   return { pool, file, prefetch };
+}
+
+/** Months of a timeline within the game's date range. */
+async function timelineMonthsInRange(client, userId, { favorites, from, to }) {
+  const months = await client.timelineMonths({ userId, favorites });
+  return months.filter(({ timeBucket: m }) => (!from || m.slice(0, 7) >= from.slice(0, 7)) && (!to || m.slice(0, 7) <= to.slice(0, 7)));
+}
+
+async function timelineTotal(client, userId, immichSettings) {
+  return (await timelineMonthsInRange(client, userId, immichSettings)).reduce((sum, m) => sum + m.count, 0);
+}
+
+/**
+ * A random sample of a partner's pictures. Search doesn't cover partners, so this reads random
+ * months of their timeline, then loads the camera data of the sampled pictures one by one.
+ * @returns {Promise<{images: any[], total: number}>}
+ */
+async function partnerLibrary(client, userId, settings, needed) {
+  const { from, to } = settings.immich;
+  const objective = MODES[settings.mode];
+  const sample = Math.min(MAX_PARTNER_SAMPLE, Math.max(MIN_PARTNER_SAMPLE, needed * 2));
+  const months = await timelineMonthsInRange(client, userId, settings.immich);
+  const total = months.reduce((sum, m) => sum + m.count, 0);
+
+  // Months picked at random, weighted by size; many of them, so the pictures span their library.
+  const picked = weightedShuffle(months, (m) => m.count).slice(0, MAX_PARTNER_MONTHS).map((m) => m.timeBucket);
+  const day = (takenAt) => takenAt.slice(0, 10);
+  const pool = (await mapLimit(picked, CONCURRENCY, (month) => client.timelineMonth(month, { userId, favorites: settings.immich.favorites })))
+    .flat()
+    .filter((a) => a.isImage && !a.isTrashed && (!from || day(a.takenAt) >= from) && (!to || day(a.takenAt) <= to))
+    // Immich only knows a place for pictures with a location.
+    .filter((a) => settings.mode !== 'location' || a.city);
+
+  const assets = await mapLimit(shuffle(pool).slice(0, sample), CONCURRENCY, (a) => client.asset(a.id).catch(() => null));
+  const images = assets
+    .filter(Boolean)
+    .map((asset) => toImage(asset, settings.immich, client))
+    .filter((image) => image && objective.isReady(image) && (!from || day(image.takenAt) >= from) && (!to || day(image.takenAt) <= to));
+  return { images: spreadOut(images), total };
+}
+
+/**
+ * Pictures from several libraries, each making up its share of the pool by how many pictures it
+ * holds, so a small sample of a big library isn't drowned out. Never fewer than `atLeast` when
+ * there are that many.
+ * @param {{images: any[], total: number}[]} libraries
+ */
+export function mix(libraries, atLeast) {
+  const usable = libraries.filter((l) => l.images.length && l.total > 0);
+  const sum = usable.reduce((s, l) => s + l.total, 0);
+  const available = usable.reduce((s, l) => s + l.images.length, 0);
+  // The largest pool every library can fill at its share.
+  const balanced = Math.min(...usable.map((l) => (l.images.length * sum) / l.total));
+  const size = Math.min(available, Math.max(Math.floor(balanced), atLeast));
+  const shuffled = usable.map((l) => shuffle(l.images));
+  const taken = usable.map((l, i) => Math.min(shuffled[i].length, Math.round((size * l.total) / sum)));
+  // Libraries that run short leave room for the others.
+  for (let i = 0; taken.reduce((s, n) => s + n, 0) < size && i < usable.length; i++) {
+    const short = size - taken.reduce((s, n) => s + n, 0);
+    taken[i] = Math.min(shuffled[i].length, taken[i] + short);
+  }
+  return shuffled.flatMap((images, i) => images.slice(0, taken[i]));
+}
+
+/** Items in random order, heavier ones more likely to come early. */
+function weightedShuffle(items, weight) {
+  // Efraimidis–Spirakis: sort by u^(1/w)
+  return items
+    .map((item) => ({ item, key: Math.random() ** (1 / Math.max(1, weight(item))) }))
+    .sort((a, b) => b.key - a.key)
+    .map((x) => x.item);
+}
+
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
 }
 
 function albumGone(err) {

@@ -23,7 +23,11 @@ function cleanImmich(raw = {}) {
   const albumId = typeof raw.albumId === 'string' && UUID_RE.test(raw.albumId) ? raw.albumId : null;
   let [from, to] = [day(raw.from), day(raw.to)];
   if (from && to && from > to) [from, to] = [to, from];
-  return { albumId, favorites: Boolean(raw.favorites), cameraOnly: raw.cameraOnly !== false, from, to };
+  return {
+    albumId, favorites: Boolean(raw.favorites), cameraOnly: raw.cameraOnly !== false, from, to,
+    // An album already holds everything shared in it.
+    partners: !albumId && Boolean(raw.partners),
+  };
 }
 
 /** @returns {import('../../shared/protocol.js').GameSettings} */

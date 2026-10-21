@@ -32,12 +32,17 @@ export function homeView(root) {
   const albumSelect = h('select', { name: 'albumId', onChange: update }, h('option', { value: '' }, 'Whole library'));
   const libraryWarning = h('p', { class: 'hint' },
     'Any picture in the library can come up, including private ones. Pick an album to choose what others see.');
+  const partnersText = h('span');
+  const partnersBox = h('input', { type: 'checkbox', name: 'partners' });
+  const partnersField = h('label', { class: 'check' }, partnersBox, partnersText);
+  let partnersShown = false;
   const immichMissing = h('p', { class: 'warn' });
   const immichFields = h('div', {},
     immichMissing,
     h('label', {}, 'Album', albumSelect),
     libraryWarning,
     h('div', { class: 'immich-options' },
+      partnersField,
       h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'favorites' }), h('span', {}, 'Favourites only')),
       h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'cameraOnly', checked: true }),
         h('span', {}, 'Camera photos only (skips screenshots and saved pictures, whose dates are often wrong)'))),
@@ -112,6 +117,8 @@ export function homeView(root) {
     setField.hidden = !fromSet;
     immichFields.hidden = !fromImmich;
     libraryWarning.hidden = Boolean(v.albumId);
+    // An album already holds everything shared in it.
+    partnersField.hidden = !partnersShown || Boolean(v.albumId);
     if (fromImmich) loadImmich();
     precisionField.hidden = v.mode !== 'date';
     orderSizeField.hidden = v.mode !== 'order';
@@ -149,6 +156,15 @@ export function homeView(root) {
         immichMissing.textContent = '';
         const albums = await api('/api/immich/albums');
         albumSelect.append(...albums.map((a) => h('option', { value: a.id }, `${a.name} (${a.count})`)));
+        const partners = await api('/api/immich/partners');
+        if (partners === null) {
+          partnersBox.disabled = true;
+          partnersText.textContent = 'Partner photos: add the partner.read and timeline.read permissions to the API key to include them';
+          partnersShown = true;
+        } else if (partners.length) {
+          partnersText.textContent = `Include photos ${partners.map((p) => p.name).join(', ')} share${partners.length === 1 ? 's' : ''} with you`;
+          partnersShown = true;
+        }
       } catch (err) {
         immichMissing.textContent = err.message;
       } finally {
@@ -194,7 +210,7 @@ export function homeView(root) {
         orderSize: Number(v.orderSize),
         presenter: Boolean(v.presenter),
         immich: v.source === 'immich'
-          ? { albumId: v.albumId || null, favorites: Boolean(v.favorites), cameraOnly: Boolean(v.cameraOnly), from: v.from || null, to: v.to || null }
+          ? { albumId: v.albumId || null, favorites: Boolean(v.favorites), cameraOnly: Boolean(v.cameraOnly), partners: Boolean(v.partners) && !v.albumId, from: v.from || null, to: v.to || null }
           : undefined,
         // the server takes km for location and hours for date
         scale: v.scale ? Number(v.scale) * (v.mode === 'date' ? 24 : 1) : undefined,

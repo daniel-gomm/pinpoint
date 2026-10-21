@@ -37,6 +37,10 @@ export class ImmichClient {
    */
   async request(apiPath, { method = 'GET', body = undefined, binary = false } = {}) {
     let res;
+    const failed = (err) => {
+      const reason = err?.name === 'TimeoutError' ? 'it did not answer in time' : 'the connection failed';
+      return new ImmichError(`Could not reach Immich at ${this.url}: ${reason}.`);
+    };
     try {
       res = await fetch(`${this.url}/api${apiPath}`, {
         method,
@@ -49,8 +53,7 @@ export class ImmichClient {
         signal: AbortSignal.timeout(TIMEOUT_MS),
       });
     } catch (err) {
-      const reason = err?.name === 'TimeoutError' ? 'it did not answer in time' : 'the connection failed';
-      throw new ImmichError(`Could not reach Immich at ${this.url}: ${reason}.`);
+      throw failed(err);
     }
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -60,7 +63,12 @@ export class ImmichClient {
       if (res.status === 404 || res.status === 400) throw new ImmichError(detail || 'Immich could not find that.', 404);
       throw new ImmichError(`Immich answered with an error (${res.status}${detail ? `: ${detail}` : ''}).`);
     }
-    return binary ? Buffer.from(await res.arrayBuffer()) : res.json();
+    try {
+      // The timeout also covers reading the body.
+      return binary ? Buffer.from(await res.arrayBuffer()) : await res.json();
+    } catch (err) {
+      throw failed(err);
+    }
   }
 
   /** Version, account and whether the key has every permission the game needs. */
@@ -100,12 +108,70 @@ export class ImmichClient {
     return this.request(`/albums/${encodeURIComponent(id)}`);
   }
 
-  /** Up to 1000 random pictures matching the filter, with their camera data. */
+  /** Up to 1000 random pictures matching the filter, with their camera data. Only the user's own pictures. */
   random(filter) {
     return this.request('/search/random', {
       method: 'POST',
       body: { type: 'IMAGE', withExif: true, visibility: 'timeline', size: 1000, ...filter },
     });
+  }
+
+  /**
+   * One page of up to 1000 pictures matching the filter, newest first. Unlike `random`, this also
+   * finds other people's pictures in an album shared with the user.
+   * @returns {Promise<{items: any[], next: number | null}>}
+   */
+  async search(filter, page = 1) {
+    const { assets } = await this.request('/search/metadata', {
+      method: 'POST',
+      body: { type: 'IMAGE', withExif: true, visibility: 'timeline', size: 1000, page, ...filter },
+    });
+    return { items: assets.items, next: assets.nextPage ? Number(assets.nextPage) : null };
+  }
+
+  /**
+   * People who share their library with the user (Immich partner sharing), or null when the key
+   * may not list them.
+   * @returns {Promise<{id: string, name: string}[] | null>}
+   */
+  async partners() {
+    try {
+      const partners = await this.request('/partners?direction=shared-with');
+      return partners.map((p) => ({ id: p.id, name: p.name || p.email }));
+    } catch (err) {
+      if (err instanceof ImmichError && err.status === 400 && /permission/.test(err.message)) return null;
+      throw err;
+    }
+  }
+
+  /**
+   * A timeline's months ("YYYY-MM-01") and how many pictures each holds: the user's own, or a
+   * partner's with `userId`. Search ignores partners, so their pictures are only found this way.
+   * @returns {Promise<{timeBucket: string, count: number}[]>}
+   */
+  timelineMonths({ userId, favorites }) {
+    return this.request(`/timeline/buckets?${timelineQuery({ userId, favorites })}`);
+  }
+
+  /**
+   * One month of a timeline, one record per picture. It has no camera data; see `asset`.
+   * @returns {Promise<{id: string, isImage: boolean, isTrashed: boolean, city: string | null, takenAt: string}[]>}
+   */
+  async timelineMonth(month, { userId, favorites }) {
+    const columns = await this.request(`/timeline/bucket?${timelineQuery({ userId, favorites, timeBucket: month })}`);
+    return columns.id.map((id, i) => ({
+      id,
+      isImage: columns.isImage[i],
+      isTrashed: columns.isTrashed[i],
+      city: columns.city[i],
+      // fileCreatedAt is UTC; adding the offset gives the wall-clock time where it was taken
+      takenAt: new Date(Date.parse(`${columns.fileCreatedAt[i]}Z`) + (columns.localOffsetHours[i] ?? 0) * 3600_000).toISOString(),
+    }));
+  }
+
+  /** One picture with its camera data, in the same shape as search results. */
+  asset(id) {
+    return this.request(`/assets/${encodeURIComponent(id)}`);
   }
 
   /** The large preview Immich generates (about 1440 px, JPEG). */
@@ -117,6 +183,16 @@ export class ImmichClient {
   link(assetId) {
     return `${this.url}/photos/${assetId}`;
   }
+}
+
+/** @param {{userId?: string | null, favorites?: boolean, timeBucket?: string}} params */
+function timelineQuery({ userId, favorites, timeBucket }) {
+  return new URLSearchParams({
+    visibility: 'timeline',
+    ...(userId ? { userId } : {}),
+    ...(favorites ? { isFavorite: 'true' } : {}),
+    ...(timeBucket ? { timeBucket } : {}),
+  }).toString();
 }
 
 /**

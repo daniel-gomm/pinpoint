@@ -130,6 +130,13 @@ app.get('/api/immich/albums', route(async (req, res) => {
   res.json(await client.albums());
 }));
 
+// null when the API key may not list partners
+app.get('/api/immich/partners', route(async (req, res) => {
+  const client = immich.client();
+  if (!client) throw new HttpError(409, 'Immich is not connected.');
+  res.json(await client.partners());
+}));
+
 // ---------- picture sets ----------
 
 app.get('/api/sets', (req, res) => {

@@ -4,7 +4,11 @@ import { joinGame, newPlayer, clickMap } from './helpers.js';
 
 test('Immich: connect, host from an album, links only for the host', async ({ page, browser }) => {
   page.on('pageerror', (err) => { throw err; });
-  const immich = await fakeImmich({ assets: Array.from({ length: 6 }, (_, i) => asset(i)) });
+  const immich = await fakeImmich({
+    assets: Array.from({ length: 6 }, (_, i) => asset(i)),
+    partnerAssets: [asset(50)],
+    permissions: ['asset.read', 'asset.view', 'album.read', 'partner.read'],
+  });
 
   // connect on the Picture sets page; a wrong key is refused with a clear message
   await page.goto('/#/sets');
@@ -24,8 +28,12 @@ test('Immich: connect, host from an album, links only for the host', async ({ pa
   await expect(form.locator('select[name=albumId] option')).toHaveCount(2);
   const warning = form.getByText('including private ones');
   await expect(warning).toBeVisible();
+  // partner photos only for the whole library: an album already holds what is shared in it
+  const partners = form.getByText('Include photos Aymara shares with you');
+  await expect(partners).toBeVisible();
   await form.locator('select[name=albumId]').selectOption({ label: 'Trip (6)' });
   await expect(warning).toBeHidden();
+  await expect(partners).toBeHidden();
   await form.locator('input[name=rounds]').fill('2');
   await form.locator('input[name=name]').fill('Host');
   await form.getByRole('button', { name: 'Create game' }).click();

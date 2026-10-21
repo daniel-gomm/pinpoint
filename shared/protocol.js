@@ -13,6 +13,7 @@
  * @property {boolean} cameraOnly skip pictures without a camera make (screenshots, messenger copies, scans)
  * @property {string | null} from YYYY-MM-DD, taken on or after
  * @property {string | null} to YYYY-MM-DD, taken on or before
+ * @property {boolean} partners also pictures from people who share their library (whole library only)
  */
 
 /**
