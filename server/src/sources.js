@@ -18,6 +18,8 @@ const MIN_PARTNER_SAMPLE = 30;
 const MAX_PARTNER_SAMPLE = 200;
 const MAX_PARTNER_MONTHS = 24;
 const CONCURRENCY = 8;
+// The longest a round waits for its pictures before it starts anyway.
+const READY_TIMEOUT_MS = 15_000;
 
 /**
  * Where a game's pictures come from: a picture set on disk, or an Immich server.
@@ -131,7 +133,22 @@ export function createSources({ store, immich }) {
     }
   }
 
-  return { pool, file, prefetch };
+  /**
+   * Resolves once a round's pictures are fetched (or failed), so its clock doesn't start while
+   * players still wait for them. Gives up after READY_TIMEOUT_MS.
+   * @returns {Promise<void>}
+   */
+  async function ready(game, index) {
+    const round = game.rounds[index];
+    if (game.settings.source !== 'immich' || !round) return;
+    let timer;
+    const loads = Promise.all(round.images.map((image) => preview(image.id).catch(() => {})));
+    const timeout = new Promise((resolve) => { timer = setTimeout(resolve, READY_TIMEOUT_MS); });
+    await Promise.race([loads, timeout]);
+    clearTimeout(timer);
+  }
+
+  return { pool, file, prefetch, ready };
 }
 
 /** Months of a timeline within the game's date range. */

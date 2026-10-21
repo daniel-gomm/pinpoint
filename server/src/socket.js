@@ -58,6 +58,8 @@ export function setupSockets(io, store, { dataDir, sources }) {
   const games = new Map();
   const saveFile = path.resolve(dataDir, 'games.json');
   let saveTimer = null;
+  /** codes of games whose next round is waiting for its pictures */
+  const advancing = new Set();
 
   function newCode() {
     let code;
@@ -201,15 +203,39 @@ export function setupSockets(io, store, { dataDir, sources }) {
     }));
 
     socket.on('game:leave', handle(() => detach(socket)));
-    socket.on('game:start', handle(async () => {
+    // Starting a round waits for its pictures, so the host can't trigger it twice meanwhile.
+    const advance = async (game, step) => {
+      if (advancing.has(game.code)) throw new GameError('The pictures for the next round are still loading.');
+      advancing.add(game.code);
+      try {
+        await step();
+      } finally {
+        advancing.delete(game.code);
+      }
+    };
+
+    socket.on('game:start', handle(() => {
       const game = gameOf(socket);
-      game.checkStart(socket.data.playerId);
-      const pool = await sources.pool(game.settings);
-      game.start(socket.data.playerId, pool);
+      const { playerId } = socket.data;
+      game.checkStart(playerId);
+      return advance(game, async () => {
+        game.prepare(await sources.pool(game.settings));
+        await sources.ready(game, 0);
+        game.checkStart(playerId);
+        game.startRound();
+      });
     }));
     socket.on('game:restart', handle(() => gameOf(socket).restart(socket.data.playerId)));
     socket.on('game:kick', handle(({ playerId }) => gameOf(socket).kick(socket.data.playerId, playerId)));
-    socket.on('round:next', handle(() => gameOf(socket).next(socket.data.playerId)));
+    socket.on('round:next', handle(() => {
+      const game = gameOf(socket);
+      const { playerId } = socket.data;
+      game.checkNext(playerId);
+      return advance(game, async () => {
+        await sources.ready(game, game.roundIndex + 1);
+        game.next(playerId);
+      });
+    }));
     socket.on('round:end', handle(() => gameOf(socket).endRoundEarly(socket.data.playerId)));
     socket.on('guess:draft', handle((payload) => gameOf(socket).setDraft(socket.data.playerId, payload)));
     socket.on('guess:submit', handle((payload) => gameOf(socket).submitGuess(socket.data.playerId, payload)));

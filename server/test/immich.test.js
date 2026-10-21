@@ -163,3 +163,23 @@ test('a game on Immich pictures: previews fetched once, links only for the host'
   assert.equal(game.snapshot(guest.id).reveal?.links, null);
   assert.equal(JSON.stringify(game.snapshot(guest.id)).includes(immich.url), false, 'players never see the Immich address');
 });
+
+test('a round waits for its pictures before it starts', async (t) => {
+  const immich = await fakeImmich({ assets: Array.from({ length: 6 }, (_, i) => asset(i)) });
+  t.after(immich.close);
+  const { config } = tempConfig(immich.url);
+  const sources = createSources({ store: /** @type {any} */ ({}), immich: config });
+  const settings = cleanSettings({ source: 'immich', mode: 'order', orderSize: 3, rounds: 2, immich: {} });
+  const game = new Game({ code: 'WAIT', settings });
+  t.after(() => game.dispose());
+  game.addPlayer('Host');
+  game.prepare(await sources.pool(settings));
+
+  const thumbnails = () => immich.calls.filter((c) => c.url?.includes('/thumbnail')).length;
+  await sources.ready(game, 0);
+  assert.equal(thumbnails(), 3, 'all of the first round’s pictures are fetched before it starts');
+  game.startRound();
+  await sources.file(game, game.imageFor(0, 2));
+  assert.equal(thumbnails(), 3, 'players get them from the cache');
+  await sources.ready(game, 5); // past the last round: nothing to wait for
+});

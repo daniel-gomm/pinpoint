@@ -174,14 +174,19 @@ export class Game {
   }
 
   next(byId) {
-    this.requireHost(byId);
-    if (this.phase !== PHASES.REVEAL) throw new GameError('Wait for the round to finish.');
+    this.checkNext(byId);
     if (this.roundIndex + 1 >= this.rounds.length) {
       this.phase = PHASES.FINISHED;
       this.touch();
     } else {
       this.startRound();
     }
+  }
+
+  /** Throws unless this person may move on from the reveal now. */
+  checkNext(byId) {
+    this.requireHost(byId);
+    if (this.phase !== PHASES.REVEAL) throw new GameError('Wait for the round to finish.');
   }
 
   /** Back to the lobby with the same players for another game. */

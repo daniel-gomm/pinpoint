@@ -353,6 +353,15 @@ export function gameView(root, codeParam) {
       h('div', { class: 'reveal-body' }, answerEl, side)));
     teardown.push(m.renderAnswer(answerEl, result, { state, colorOf }));
 
+    // The next round waits on the server until its pictures are loaded.
+    let advancing = false;
+    async function next() {
+      advancing = true;
+      ui.update();
+      await act('round:next');
+      advancing = false;
+      ui.update?.();
+    }
     ui.update = () => {
       const last = result.index + 1 >= state.totalRounds;
       side.replaceChildren(...[
@@ -363,8 +372,8 @@ export function gameView(root, codeParam) {
         originalLinks(result),
         resultsTable(result),
         isHost()
-          ? h('button', { class: 'btn primary big', type: 'button', onClick: () => act('round:next') },
-              last ? 'Show final scores' : 'Next round')
+          ? h('button', { class: 'btn primary big', type: 'button', disabled: advancing, onClick: next },
+              advancing ? 'Loading pictures…' : last ? 'Show final scores' : 'Next round')
           : h('p', { class: 'waiting' }, `Waiting for ${hostName()} to continue.`),
       ].filter(Boolean));
     };
